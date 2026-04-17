@@ -1,0 +1,35 @@
+# GMGD GPT-2 群扩展配置
+
+# 模型配置
+base_model_name: gpt2
+group_d: 32
+num_generators: 12
+group_type: orthogonal  # 'orthogonal' 或 'general_linear'
+
+# 群光滑层配置
+proj_steps: 1
+smooth_lr: 0.1
+
+# 训练配置
+epochs: 3
+batch_size: 16
+learning_rate: 1.0e-4
+group_lr: 1.0e-5  # MetaGroup 学习率
+proj_lr: 1.0e-5   # 投影层学习率
+rel_loss_weight: 0.1
+ortho_loss_weight: 0.01
+max_grad_norm: 1.0
+
+# 数据配置
+train_samples: 5000
+eval_samples: 500
+max_expr_depth: 3
+
+# 输出配置
+output_dir: ./checkpoints
+save_interval: 1
+log_interval: 10
+
+# 设备配置
+device: cpu  # 'cuda', 'cpu', 或 'mps'
+seed: 42
