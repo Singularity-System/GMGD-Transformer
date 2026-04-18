@@ -137,6 +137,10 @@ class GPTWithGroup(nn.Module):
             loss: 若提供 labels，返回交叉熵损失
         """
         # 通过基础 GPT-2 模型（但不经过最后的 layer norm）
+        # 强制使用 dict 返回格式，方便获取 loss
+        if return_dict is None:
+            return_dict = True
+
         outputs = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -218,6 +222,7 @@ class GPTWithGroup(nn.Module):
             生成的 token ID 序列
         """
         from transformers import GenerationConfig
+        from transformers.generation.utils import GenerationMixin
 
         if pad_token_id is None:
             pad_token_id = self.config.pad_token_id
@@ -235,7 +240,9 @@ class GPTWithGroup(nn.Module):
             eos_token_id=eos_token_id,
         )
 
-        return self.base_model.generate(
+        # 使用 GenerationMixin 的 generate 方法
+        return GenerationMixin.generate(
+            self,
             input_ids=input_ids,
             generation_config=generation_config,
             **kwargs
