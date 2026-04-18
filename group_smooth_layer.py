@@ -87,11 +87,14 @@ class GroupSmoothLayer(nn.Module):
         self.proj_to = nn.Linear(hidden_dim, matrix_dim, bias=True)
         self.proj_from = nn.Linear(matrix_dim, hidden_dim, bias=True)
 
-        # 初始化 proj_from 为零，确保初始时群光滑层为恒等映射
-        nn.init.zeros_(self.proj_from.weight)
+        # 初始化：小噪声初始化（非零），让群层从一开始就参与学习
+        # 零初始化会导致梯度短路 — 模型会跳过群层直接学习
+        nn.init.normal_(self.proj_to.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.proj_to.bias)
+        nn.init.normal_(self.proj_from.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.proj_from.bias)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> tuple:
         """
         前向传播：群光滑操作
 
@@ -100,6 +103,8 @@ class GroupSmoothLayer(nn.Module):
 
         Returns:
             群光滑后的隐状态（与输入同形）
+            流形距离（标量张量，用于对齐损失）
+            群增量矩阵 (B, S, d, d) — 该层对群流形的贡献
         """
         # 保存原始形状
         original_shape = hidden_states.shape
@@ -129,8 +134,16 @@ class GroupSmoothLayer(nn.Module):
             lr=self.smooth_lr
         )
 
+        # 计算群增量（光滑后 - 光滑前）— 该层对群流形的贡献
+        delta_group = matrices_smooth - matrices  # (B*S, d, d)
+
+        # 新增：计算流形距离（投影前后差异）
+        # 这度量了 hidden 表征偏离群流形的程度
+        manifold_distance = torch.norm(matrices_smooth - matrices, dim=(-2, -1)).mean()
+
         # 重塑回 (B, S, d*d)
         smooth_flat = matrices_smooth.view(batch_size, seq_len, -1)
+        delta_group_flat = delta_group.view(batch_size, seq_len, self.group_d, self.group_d)
 
         # 反投影：(B, S, d*d) → (B, S, H)
         smooth_hidden = self.proj_from(smooth_flat)
@@ -141,8 +154,9 @@ class GroupSmoothLayer(nn.Module):
         # 恢复原始形状
         if squeeze_output:
             output = output.squeeze(0)
+            delta_group_flat = delta_group_flat.squeeze(0)
 
-        return output
+        return output, manifold_distance, delta_group_flat
 
     def set_proj_steps(self, steps: int) -> None:
         """
