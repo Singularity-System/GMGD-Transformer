@@ -73,12 +73,12 @@ class GPTWithGroup(nn.Module):
         self.num_generators = num_generators
         self.group_type = group_type
 
-        # 加载基础 GPT-2 模型
+        # 加载基础 GPT-2 模型（使用 GPT2LMHeadModel 以便支持 generate）
         if use_pretrained:
-            self.base_model = GPT2Model.from_pretrained(base_model_name)
+            self.base_model = GPT2LMHeadModel.from_pretrained(base_model_name)
         else:
             config = GPT2Config.from_pretrained(base_model_name)
-            self.base_model = GPT2Model(config)
+            self.base_model = GPT2LMHeadModel(config)
 
         # 获取模型配置
         self.config = self.base_model.config
@@ -107,8 +107,8 @@ class GPTWithGroup(nn.Module):
 
         # 语言模型头（与词嵌入共享权重）
         self.lm_head = nn.Linear(self.hidden_dim, self.vocab_size, bias=False)
-        # 绑定权重
-        self.lm_head.weight = self.base_model.wte.weight
+        # 绑定权重（GPT2LMHeadModel 的结构）
+        self.lm_head.weight = self.base_model.transformer.wte.weight
 
     def forward(
         self,
@@ -121,7 +121,7 @@ class GPTWithGroup(nn.Module):
         labels: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        return_dict: Optional[bool] = True,  # 默认为 True
     ) -> Union[Tuple[torch.Tensor], dict]:
         """
         前向传播
@@ -136,12 +136,9 @@ class GPTWithGroup(nn.Module):
             logits: 语言模型输出 (B, S, vocab_size)
             loss: 若提供 labels，返回交叉熵损失
         """
-        # 通过基础 GPT-2 模型（但不经过最后的 layer norm）
-        # 强制使用 dict 返回格式，方便获取 loss
-        if return_dict is None:
-            return_dict = True
-
-        outputs = self.base_model(
+        # 通过基础 GPT-2 模型获取隐藏状态
+        # 使用 transformer 层而不是 LMHeadModel 来获取 hidden states
+        transformer_outputs = self.base_model.transformer(
             input_ids=input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
@@ -154,13 +151,61 @@ class GPTWithGroup(nn.Module):
         )
 
         # 获取最后一层隐藏状态
-        hidden_states = outputs[0]  # (B, S, H)
+        hidden_states = transformer_outputs[0]  # (B, S, H)
 
         # 依次通过每一层的群光滑层
-        # 注意：这里的设计是在 GPT-2 的所有层之后再做群光滑
-        # 如果需要在每一层 GPT-2 块之后立即做群光滑，需要修改 GPT-2 的前向逻辑
-        for smooth_layer in self.smooth_layers:
-            hidden_states = smooth_layer(hidden_states)
+        # 关键改进：全局群状态累乘（路径积分机制）
+        # 每一层在同一个群流形轨道上继续滑行，而不是独立投影
+
+        # 初始化全局群状态为单位矩阵 (B, d, d)
+        batch_size = hidden_states.shape[0]
+        global_group_state = torch.eye(
+            self.group_d,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device
+        ).unsqueeze(0).expand(batch_size, -1, -1)  # (B, d, d)
+
+        # 累积流形距离和群增量
+        manifold_distance = 0.0
+        layer_delta_groups = []  # 记录每层贡献用于分析
+
+        for i, smooth_layer in enumerate(self.smooth_layers):
+            hidden_states, layer_manifold_dist, delta_group = smooth_layer(hidden_states)
+            manifold_distance = manifold_distance + layer_manifold_dist
+            layer_delta_groups.append(delta_group)
+
+            # 累乘群增量：使用指数映射保证结果仍在群流形上
+            # global_state = global_state @ exp(mean(delta_group))
+            # 对序列维度取平均，得到 (B, d, d) 的群增量
+            delta_group_mean = delta_group.mean(dim=1)  # (B, d, d)
+
+            # 使用 Cayley 变换将增量映射到群流形（保持正交性）
+            # 对于正交群，exp(δ) ≈ (I + δ/2) @ (I - δ/2)^{-1}
+            d = self.group_d
+            I = torch.eye(d, dtype=hidden_states.dtype, device=hidden_states.device)
+            I_batch = I.unsqueeze(0).expand(batch_size, -1, -1)
+
+            # 取反对称部分（保证指数映射到正交群）
+            delta_skew = 0.5 * (delta_group_mean - delta_group_mean.transpose(-2, -1))
+
+            # Cayley 变换：exp(δ) ≈ (I + δ/2) @ (I - δ/2)^{-1}
+            half_delta = 0.5 * delta_skew
+            numerator = I_batch + half_delta
+            denominator = I_batch - half_delta
+
+            # 矩阵求逆（批量）
+            try:
+                denominator_inv = torch.linalg.inv(denominator)
+                exp_delta = numerator @ denominator_inv
+
+                # 累乘：global_state = global_state @ exp(δ)
+                global_group_state = global_group_state @ exp_delta
+            except RuntimeError:
+                # 求逆失败时回退到简单加法
+                global_group_state = global_group_state @ (I_batch + delta_group_mean)
+
+        # 平均流形距离（跨层数）
+        manifold_distance = manifold_distance / len(self.smooth_layers)
 
         # 计算语言模型 logits
         logits = self.lm_head(hidden_states)
@@ -180,21 +225,24 @@ class GPTWithGroup(nn.Module):
 
         # 返回
         if not return_dict:
-            output = (logits,) + outputs[1:]
+            output = (logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+            manifold_distance=manifold_distance,
+            global_group_state=global_group_state,  # 全局群状态（路径积分结果）
         )
 
     def generate(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         max_length: int = 100,
+        max_new_tokens: int = None,
         num_beams: int = 1,
         do_sample: bool = False,
         temperature: float = 1.0,
@@ -205,11 +253,12 @@ class GPTWithGroup(nn.Module):
         **kwargs
     ) -> torch.LongTensor:
         """
-        文本生成
+        文本生成（简化版本，避免与 transformers 新版本冲突）
 
         Args:
             input_ids: 输入 prompt 的 token ID
             max_length: 最大生成长度
+            max_new_tokens: 最大新生成 token 数（优先于 max_length）
             num_beams: Beam search 的 beam 数
             do_sample: 是否采样
             temperature: 采样温度
@@ -222,15 +271,20 @@ class GPTWithGroup(nn.Module):
             生成的 token ID 序列
         """
         from transformers import GenerationConfig
-        from transformers.generation.utils import GenerationMixin
 
         if pad_token_id is None:
             pad_token_id = self.config.pad_token_id
         if eos_token_id is None:
             eos_token_id = self.config.eos_token_id
 
+        # 计算实际的 max_length
+        if max_new_tokens is not None:
+            actual_max_length = input_ids.shape[1] + max_new_tokens
+        else:
+            actual_max_length = max_length
+
         generation_config = GenerationConfig(
-            max_length=max_length,
+            max_length=actual_max_length,
             num_beams=num_beams,
             do_sample=do_sample,
             temperature=temperature,
@@ -240,9 +294,8 @@ class GPTWithGroup(nn.Module):
             eos_token_id=eos_token_id,
         )
 
-        # 使用 GenerationMixin 的 generate 方法
-        return GenerationMixin.generate(
-            self,
+        # 使用 base_model 的 generate 方法（它继承自 GenerationMixin）
+        return self.base_model.generate(
             input_ids=input_ids,
             generation_config=generation_config,
             **kwargs
@@ -344,3 +397,5 @@ class CausalLMOutputWithCrossAttentions:
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
+    manifold_distance: Optional[torch.FloatTensor] = None
+    global_group_state: Optional[torch.FloatTensor] = None  # 全局群状态 (B, d, d)

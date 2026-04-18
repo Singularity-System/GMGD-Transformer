@@ -91,6 +91,32 @@ def compute_relation_loss(meta_group: MetaGroup, args) -> torch.Tensor:
     return meta_group.relation_loss(relations)
 
 
+def compute_group_coherence_loss(global_group_state: torch.Tensor, target_group_state: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    计算全局群相干损失
+
+    对于算术任务，目标群状态对应于表达式的矩阵乘积表示
+    目前使用单位矩阵作为默认目标（恒等变换）
+
+    Args:
+        global_group_state: 全局群状态 (B, d, d)
+        target_group_state: 目标群状态（可选）
+
+    Returns:
+        群相干损失
+    """
+    if target_group_state is None:
+        # 默认目标：单位矩阵（表示没有净变换）
+        batch_size, d, _ = global_group_state.shape
+        target_group_state = torch.eye(
+            d,
+            dtype=global_group_state.dtype,
+            device=global_group_state.device
+        ).unsqueeze(0).expand(batch_size, -1, -1)
+
+    return torch.nn.functional.mse_loss(global_group_state, target_group_state)
+
+
 def train_epoch(
     model: GPTWithGroup,
     dataloader: DataLoader,
@@ -110,6 +136,8 @@ def train_epoch(
     total_task_loss = 0.0
     total_rel_loss = 0.0
     total_ortho_loss = 0.0
+    total_manifold_loss = 0.0
+    total_group_coherence_loss = 0.0
     num_batches = 0
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}")
@@ -125,6 +153,7 @@ def train_epoch(
         )
 
         task_loss = outputs.loss
+        manifold_distance = outputs.manifold_distance if hasattr(outputs, 'manifold_distance') else torch.tensor(0.0, device=device)
 
         # 计算群关系损失
         rel_loss = compute_relation_loss(model.meta_group, args)
@@ -135,11 +164,19 @@ def train_epoch(
         else:
             ortho_loss = torch.tensor(0.0, device=device)
 
+        # 计算全局群相干损失（路径积分一致性）
+        if hasattr(outputs, 'global_group_state') and outputs.global_group_state is not None:
+            group_coherence_loss = compute_group_coherence_loss(outputs.global_group_state)
+        else:
+            group_coherence_loss = torch.tensor(0.0, device=device)
+
         # 总损失
         total_loss = (
             task_loss +
             args.rel_loss_weight * rel_loss +
-            args.ortho_loss_weight * ortho_loss
+            args.ortho_loss_weight * ortho_loss +
+            args.manifold_loss_weight * manifold_distance +
+            args.group_coherence_weight * group_coherence_loss
         )
 
         # 反向传播
@@ -156,19 +193,25 @@ def train_epoch(
         total_task_loss += task_loss.item()
         total_rel_loss += rel_loss.item()
         total_ortho_loss += ortho_loss.item()
+        total_manifold_loss += manifold_distance.item()
+        total_group_coherence_loss += group_coherence_loss.item()
         num_batches += 1
 
         # 更新进度条
         pbar.set_postfix({
             'task_loss': f"{task_loss.item():.4f}",
             'rel_loss': f"{rel_loss.item():.6f}",
-            'ortho_loss': f"{ortho_loss.item():.6f}"
+            'ortho_loss': f"{ortho_loss.item():.6f}",
+            'manifold_dist': f"{manifold_distance.item():.6f}",
+            'group_coh': f"{group_coherence_loss.item():.6f}"
         })
 
     return {
         'task_loss': total_task_loss / num_batches,
         'rel_loss': total_rel_loss / num_batches,
-        'ortho_loss': total_ortho_loss / num_batches
+        'ortho_loss': total_ortho_loss / num_batches,
+        'manifold_distance': total_manifold_loss / num_batches,
+        'group_coherence': total_group_coherence_loss / num_batches
     }
 
 
@@ -263,6 +306,10 @@ def main():
                         help='Weight for relation loss')
     parser.add_argument('--ortho_loss_weight', type=float, default=0.01,
                         help='Weight for orthogonality loss')
+    parser.add_argument('--manifold_loss_weight', type=float, default=0.1,
+                        help='Weight for manifold alignment loss')
+    parser.add_argument('--group_coherence_weight', type=float, default=0.01,
+                        help='Weight for group coherence loss')
     parser.add_argument('--max_grad_norm', type=float, default=1.0,
                         help='Max gradient norm for clipping')
 
