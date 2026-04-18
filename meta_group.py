@@ -44,8 +44,15 @@ def cayley_exp(A: torch.Tensor) -> torch.Tensor:
     A_skew = torch.where(scale > 1.0, A_skew / scale, A_skew)
 
     # Cayley 变换
-    I = torch.eye(A.shape[-1], device=A.device, dtype=A.dtype)
-    I_expanded = I.view(1, 1, -1, -1) if A.dim() == 4 else I.view(1, -1, -1)
+    d = A.shape[-1]
+    I = torch.eye(d, device=A.device, dtype=A.dtype)
+    # 根据输入维度扩展单位矩阵
+    if A.dim() == 4:
+        I_expanded = I.unsqueeze(0).unsqueeze(0)  # (1, 1, d, d)
+    elif A.dim() == 3:
+        I_expanded = I.unsqueeze(0)  # (1, d, d)
+    else:
+        I_expanded = I  # (d, d)
 
     half_A = 0.5 * A_skew
     numerator = I_expanded + half_A

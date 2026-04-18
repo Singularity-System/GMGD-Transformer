@@ -194,20 +194,16 @@ def evaluate(
         for batch in tqdm(dataloader, desc="Evaluating"):
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
-            answers = batch['answer']
 
             outputs = model(input_ids=input_ids, labels=labels)
-            total_loss += outputs.loss.item()
+            # 支持 dict 或 object 返回
+            if isinstance(outputs, dict):
+                loss = outputs.get('loss', None)
+            else:
+                loss = outputs.loss
+            if loss is not None:
+                total_loss += loss.item()
 
-            # 生成预测
-            generated = model.generate(
-                input_ids=input_ids,
-                max_length=input_ids.shape[1] + 10,
-                do_sample=False
-            )
-
-            # 解析预测答案（简化版本）
-            # 实际应用中应更精确地解析
             num_batches += 1
 
     return {
