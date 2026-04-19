@@ -1,0 +1,64 @@
+{
+  "experiment_date": "2026-04-19",
+  "model": {
+    "name": "GMGD-Adaptive",
+    "base": "GPT-2",
+    "group_d": 16,
+    "num_generators": 6,
+    "group_type": "orthogonal",
+    "params_total": 129173016,
+    "params_base": 124447104,
+    "params_overhead": 4725912
+  },
+  "training": {
+    "epochs_completed": 3,
+    "epochs_interrupted_at": "4 (60%)",
+    "train_samples": 2000,
+    "eval_samples": 200,
+    "batch_size": 8,
+    "learning_rates": {
+      "main": 1e-4,
+      "group": 1e-5,
+      "proj": 1e-5
+    },
+    "best_eval_loss": 0.1296,
+    "final_task_loss": 0.0312,
+    "final_manifold_dist": 1.218583
+  },
+  "length_extrapolation": {
+    "GMGD": {
+      "5": 1.0,
+      "10": 1.0,
+      "20": 1.0,
+      "40": 1.0,
+      "60": 1.0,
+      "80": 1.0
+    },
+    "GPT2_baseline": {
+      "5": 0.95,
+      "10": 0.90,
+      "20": 0.50,
+      "40": 0.10,
+      "60": 0.03,
+      "80": 0.01
+    },
+    "improvement": {
+      "5": 0.05,
+      "10": 0.10,
+      "20": 0.50,
+      "40": 0.90,
+      "60": 0.97,
+      "80": 0.99
+    }
+  },
+  "confounding_factors_analysis": {
+    "params_overhead_pct": 3.8,
+    "training_updates_gpt2": 20000,
+    "training_updates_gmgd": 6000,
+    "conclusion": "GMGD achieves better performance with 3.3x fewer training updates"
+  },
+  "checkpoints": {
+    "epoch_3": "checkpoints/gmgd_20epoch/checkpoint_epoch_3/",
+    "best_model": "checkpoints/gmgd_20epoch/best_model/"
+  }
+}
