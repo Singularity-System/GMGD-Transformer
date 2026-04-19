@@ -34,7 +34,7 @@ export TRANSFORMERS_CACHE=/path/to/cache
 ## 快速开始
 
 ```python
-from gpt_with_group import GPTWithGroup
+from core import GPTWithGroup
 
 model = GPTWithGroup(
     base_model_name='gpt2',
@@ -53,15 +53,25 @@ logits = model(input_ids)
 gmgd-transformer/
 ├── README.md
 ├── requirements.txt
-├── meta_group.py          # 可学习群表示
-├── group_smooth_layer.py  # 群光滑层
-├── gpt_with_group.py      # 群扩展 GPT 模型
-├── train.py               # 训练脚本
-├── evaluate.py            # 评估脚本
-├── export_edge.py         # 导出纯群推理核
-├── data/                  # 数据生成器
-├── configs/               # 配置文件
-└── scripts/               # 运行脚本
+├── core/                    # 核心模块（可复用）
+│   ├── __init__.py
+│   ├── meta_group.py        # 可学习群表示
+│   ├── group_smooth_layer.py # 群光滑层
+│   └── gpt_with_group.py    # 群扩展 GPT 模型
+├── data/                    # 数据生成器
+│   ├── arithmetic.py        # 算术表达式数据
+│   └── synthetic_reasoning.py # 合成推理数据
+├── configs/                 # 配置文件
+├── scripts/                 # 工具脚本
+├── train.py                 # 训练脚本
+├── evaluate.py              # 评估脚本
+├── export_edge.py           # 导出纯群推理核
+├── experiments/             # 实验脚本和结果
+│   ├── length_extrapolation.py    # 长度外推实验
+│   ├── test_global_group_state.py # 群状态测试
+│   └── length_extrapolation_results/
+├── checkpoints/             # 模型检查点
+└── IMPLEMENTATION_PATH_INTEGRAL.md  # 路径积分实现说明
 ```
 
 ## 文档

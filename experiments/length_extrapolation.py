@@ -10,7 +10,10 @@
     python length_extrapolation.py
 """
 
+import sys
 import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
 import json
 import torch
 import torch.nn as nn
@@ -22,8 +25,7 @@ from tqdm import tqdm
 import random
 import re
 
-from gpt_with_group import GPTWithGroup
-from meta_group import MetaGroup
+from core import GPTWithGroup, MetaGroup
 
 
 # ==================== 数据生成 ====================
@@ -429,7 +431,8 @@ def run_extrapolation_experiment(
     epochs: int = 3,
     batch_size: int = 16,
     samples_per_split: int = 500,
-    save_dir: str = './length_extrapolation_results'
+    save_dir: str = './length_extrapolation_results',
+    skip_gpt2: bool = True  # 新增参数：跳过 GPT-2 基线
 ):
     """
     运行完整的长度外推实验
@@ -495,60 +498,74 @@ def run_extrapolation_experiment(
     }
 
     # ========== 实验 1: GPT-2 基线 ==========
-    print("\n" + "=" * 60)
-    print("实验 1: GPT-2 基线模型")
-    print("=" * 60)
+    if not skip_gpt2:
+        print("\n" + "=" * 60)
+        print("实验 1: GPT-2 基线模型")
+        print("=" * 60)
 
-    gpt2_model = GPT2LMHeadModel.from_pretrained('gpt2')
-    # 修改 forward 使其返回兼容格式
-    gpt2_model.config.return_dict = True
+        gpt2_model = GPT2LMHeadModel.from_pretrained('gpt2')
+        # 修改 forward 使其返回兼容格式
+        gpt2_model.config.return_dict = True
 
-    # 包装一下，使其有 forward 和 generate 方法
-    class GPT2Wrapper(nn.Module):
-        def __init__(self, model):
-            super().__init__()
-            self.model = model
+        # 包装一下，使其有 forward 和 generate 方法
+        class GPT2Wrapper(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
 
-        def forward(self, input_ids, labels=None, **kwargs):
-            outputs = self.model(input_ids=input_ids, labels=labels, **kwargs)
-            return {'loss': outputs.loss, 'logits': outputs.logits}
+            def forward(self, input_ids, labels=None, **kwargs):
+                outputs = self.model(input_ids=input_ids, labels=labels, **kwargs)
+                return {'loss': outputs.loss, 'logits': outputs.logits}
 
-        def generate(self, input_ids, max_new_tokens=20, do_sample=False, **kwargs):
-            # 使用 max_new_tokens 而不是 max_length
-            return self.model.generate(
-                input_ids=input_ids,
-                max_new_tokens=max_new_tokens,
-                do_sample=do_sample,
-                **kwargs
-            )
+            def generate(self, input_ids, max_new_tokens=20, do_sample=False, **kwargs):
+                # 使用 max_new_tokens 而不是 max_length
+                return self.model.generate(
+                    input_ids=input_ids,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=do_sample,
+                    **kwargs
+                )
 
-    gpt2_wrapper = GPT2Wrapper(gpt2_model)
+        gpt2_wrapper = GPT2Wrapper(gpt2_model)
 
-    # 训练
-    gpt2_losses = train_model(
-        gpt2_wrapper,
-        train_loader,
-        epochs=epochs,
-        learning_rate=1e-4,
-        save_path=os.path.join(save_dir, 'gpt2_baseline')
-    )
-    results['GPT-2']['train_losses'] = gpt2_losses
-
-    # 评估各长度（首次运行时开启 debug 查看生成内容）
-    debug_mode = True  # 第一次运行时开启调试
-    for length in test_lengths:
-        print(f"\n评估 GPT-2 在长度 {length}...")
-        test_loader = dataset.get_test_loader(length, batch_size=batch_size)
-        acc = evaluate_length_extrapolation(
-            gpt2_wrapper, test_loader, tokenizer, debug=debug_mode
+        # 训练
+        gpt2_losses = train_model(
+            gpt2_wrapper,
+            train_loader,
+            epochs=epochs,
+            learning_rate=1e-4,
+            save_path=os.path.join(save_dir, 'gpt2_baseline')
         )
-        results['GPT-2'][length] = acc
-        print(f"  长度 {length}: 准确率 = {acc:.2%}")
-        debug_mode = False  # 只显示第一批调试信息
+        results['GPT-2']['train_losses'] = gpt2_losses
 
-    # 清理内存
-    del gpt2_wrapper
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        # 评估各长度（首次运行时开启 debug 查看生成内容）
+        debug_mode = True  # 第一次运行时开启调试
+        for length in test_lengths:
+            print(f"\n评估 GPT-2 在长度 {length}...")
+            test_loader = dataset.get_test_loader(length, batch_size=batch_size)
+            acc = evaluate_length_extrapolation(
+                gpt2_wrapper, test_loader, tokenizer, debug=debug_mode
+            )
+            results['GPT-2'][length] = acc
+            print(f"  长度 {length}: 准确率 = {acc:.2%}")
+            debug_mode = False  # 只显示第一批调试信息
+
+        # 清理内存
+        del gpt2_wrapper
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    else:
+        print("\n" + "=" * 60)
+        print("跳过 GPT-2 基线实验（已使用先前结果）")
+        print("=" * 60)
+        # 从已有结果文件加载 GPT-2 结果
+        results_path = os.path.join(save_dir, 'results.json')
+        if os.path.exists(results_path):
+            with open(results_path, 'r') as f:
+                existing_results = json.load(f)
+            results['GPT-2'] = existing_results.get('GPT-2', {})
+            print(f"已从 {results_path} 加载 GPT-2 结果")
+        else:
+            print("警告：未找到已有结果文件，GPT-2 结果将为空")
 
     # ========== 实验 2: GMGD-1 ==========
     print("\n" + "=" * 60)
@@ -575,7 +592,7 @@ def run_extrapolation_experiment(
         epochs=epochs,
         learning_rate=1e-4,
         group_lr=5e-4,  # 群参数 5x 学习率
-        manifold_loss_weight=1.0,  # 流形损失权重 1.0（强约束）
+        manifold_loss_weight=0.1,  # 流形损失权重 0.1（温和约束，避免损害语言能力）
         save_path=os.path.join(save_dir, 'gmgd_model')
     )
     results['GMGD-1']['train_losses'] = gmgd_losses
@@ -677,6 +694,8 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cuda',
                         choices=['cuda', 'cpu', 'mps'],
                         help='Device to use')
+    parser.add_argument('--skip_gpt2', action='store_true', default=True,
+                        help='Skip GPT-2 baseline experiment (use existing results)')
 
     args = parser.parse_args()
 
@@ -700,5 +719,6 @@ if __name__ == '__main__':
         epochs=args.epochs,
         batch_size=args.batch_size,
         samples_per_split=args.samples,
-        save_dir=args.output_dir
+        save_dir=args.output_dir,
+        skip_gpt2=args.skip_gpt2
     )

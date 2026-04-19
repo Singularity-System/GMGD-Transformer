@@ -23,8 +23,7 @@ from transformers import GPT2Tokenizer
 from tqdm import tqdm
 import numpy as np
 
-from gpt_with_group import GPTWithGroup
-from meta_group import MetaGroup
+from core import GPTWithGroup, MetaGroup
 from data.arithmetic import ArithmeticDataset, create_length_split_datasets
 from data.synthetic_reasoning import TransitivityDataset
 
