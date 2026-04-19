@@ -107,8 +107,10 @@ class GroupSmoothLayer(nn.Module):
         # === 自适应机制 ===
         if self.adaptive:
             # 可学习的残差权重 α，控制群光滑的影响强度
-            # 使用 sigmoid 保证 α ∈ (0, 1)，初始化为 0.5
-            self.weight_alpha = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.5
+            # 使用 sigmoid 保证 α ∈ (0, 1)
+            # 初始化为 -2，sigmoid(-2)≈0.12，让群模块在训练初期保持弱影响
+            # 等 Transformer 先学会语言理解，再逐渐增强群约束
+            self.weight_alpha = nn.Parameter(torch.tensor(-2.0))  # sigmoid(-2) ≈ 0.12
 
             # 门控网络：根据输入特征动态调整投影强度
             # 输入：隐状态的统计特征 (mean, std)，输出：门控值 g ∈ (0, 1)
@@ -172,10 +174,10 @@ class GroupSmoothLayer(nn.Module):
             # 应用门控到输入矩阵
             matrices_gated = gate_value * matrices
 
-            # 2. 计算自适应学习率基础值
-            # 流形距离越大，学习率越高（需要更多调整）
-            base_manifold_dist = torch.norm(matrices, dim=(-2, -1)).mean().detach()
-            adaptive_lr_factor = 1.0 + base_manifold_dist  # 动态缩放
+            # 2. 移除自适应学习率放大因子
+            # 原因：在训练初期流形距离很大时会导致梯度爆炸
+            # 让优化器通过 weight_alpha 自然学习合适的强度
+            adaptive_lr_factor = 1.0
 
         else:
             matrices_gated = matrices

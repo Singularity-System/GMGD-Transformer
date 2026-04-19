@@ -32,14 +32,16 @@ from transformers import GPT2Model, GPT2Config
 
 from .meta_group import MetaGroup
 from .group_smooth_layer import GroupSmoothLayer
+from .dynamic_expander import DynamicGroupExpander
 from dataclasses import dataclass
 
 
 class GPTWithGroup(nn.Module):
     """
-    群扩展 GPT-2 模型
+    群扩展 GPT-2 模型（支持动态群扩张）
 
     在标准 GPT-2 的每一层后添加 GroupSmoothLayer，将隐状态投影到群流形。
+    使用 DynamicGroupExpander 自动管理多个 MetaGroup 实例。
 
     参数：
         base_model_name: 基础 GPT-2 模型名称 ('gpt2', 'gpt2-medium', 'gpt2-large')
@@ -49,15 +51,8 @@ class GPTWithGroup(nn.Module):
         proj_steps: 投影梯度步数
         smooth_lr: 群光滑层学习率
         use_pretrained: 是否使用预训练权重
-
-    示例：
-        >>> model = GPTWithGroup(
-        ...     base_model_name='gpt2',
-        ...     group_d=32,
-        ...     num_generators=12
-        ... )
-        >>> input_ids = torch.randint(0, 50257, (4, 100))
-        >>> logits = model(input_ids)  # (4, 100, 50257)
+        enable_dynamic_expansion: 是否启用动态群扩张
+        expansion_threshold: 路径积分闭合误差阈值（超过则触发扩张）
     """
 
     def __init__(
@@ -68,7 +63,10 @@ class GPTWithGroup(nn.Module):
         group_type: str = 'orthogonal',
         proj_steps: int = 1,
         smooth_lr: float = 0.1,
-        use_pretrained: bool = True
+        use_pretrained: bool = True,
+        enable_dynamic_expansion: bool = False,
+        expansion_threshold: float = 0.5,
+        max_generators_per_group: int = 12
     ):
         super().__init__()
 
@@ -76,6 +74,7 @@ class GPTWithGroup(nn.Module):
         self.group_d = group_d
         self.num_generators = num_generators
         self.group_type = group_type
+        self.enable_dynamic_expansion = enable_dynamic_expansion
 
         # 加载基础 GPT-2 模型（使用 GPT2Model 以便在每一层后插入群光滑层）
         if use_pretrained:
@@ -90,24 +89,46 @@ class GPTWithGroup(nn.Module):
         self.num_layers = self.config.n_layer  # 12 for gpt2, 24 for gpt2-medium
         self.vocab_size = self.config.vocab_size  # 50257
 
-        # 创建共享的 MetaGroup
-        self.meta_group = MetaGroup(
-            num_generators=num_generators,
-            d=group_d,
-            group_type=group_type
-        )
-
-        # 为每一层创建 GroupSmoothLayer
-        self.smooth_layers = nn.ModuleList([
-            GroupSmoothLayer(
+        # 动态群扩张模式
+        if enable_dynamic_expansion:
+            self.expander = DynamicGroupExpander(
                 hidden_dim=self.hidden_dim,
-                group_d=group_d,
-                meta_group=self.meta_group,  # 共享同一元群
-                proj_steps=proj_steps,
-                smooth_lr=smooth_lr
+                initial_group_d=group_d,
+                initial_num_generators=num_generators,
+                group_type=group_type,
+                threshold=expansion_threshold,
+                max_generators_per_group=max_generators_per_group
             )
-            for _ in range(self.num_layers)
-        ])
+            # 所有层共享同一个 expander（包含 registry 和 router）
+            self.smooth_layers = nn.ModuleList([
+                GroupSmoothLayer(
+                    hidden_dim=self.hidden_dim,
+                    group_d=group_d,
+                    meta_group=self.expander.registry.groups['default'],
+                    proj_steps=proj_steps,
+                    smooth_lr=smooth_lr,
+                    adaptive=True
+                )
+                for _ in range(self.num_layers)
+            ])
+        else:
+            # 单群模式（向后兼容）
+            self.expander = None
+            self.meta_group = MetaGroup(
+                num_generators=num_generators,
+                d=group_d,
+                group_type=group_type
+            )
+            self.smooth_layers = nn.ModuleList([
+                GroupSmoothLayer(
+                    hidden_dim=self.hidden_dim,
+                    group_d=group_d,
+                    meta_group=self.meta_group,
+                    proj_steps=proj_steps,
+                    smooth_lr=smooth_lr
+                )
+                for _ in range(self.num_layers)
+            ])
 
         # 语言模型头（与词嵌入共享权重）
         self.lm_head = nn.Linear(self.hidden_dim, self.vocab_size, bias=False)
@@ -126,6 +147,9 @@ class GPTWithGroup(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = True,  # 默认返回 dict 格式
+        target_group_state: Optional[torch.Tensor] = None,  # 用于路径积分闭合分析
+        global_step: int = 0,  # 当前训练步数
+        expansion_warmup_steps: int = 50,  # 扩张 warmup 步数
     ) -> Union[Tuple[torch.Tensor], dict]:
         """
         前向传播
@@ -134,6 +158,8 @@ class GPTWithGroup(nn.Module):
             input_ids: 输入 token ID (B, S)
             attention_mask: 注意力掩码 (B, S)
             labels: 标签（用于计算损失）
+            target_group_state: 目标群状态 (B, d, d)，用于路径积分闭合分析
+            global_step: 当前训练步数（用于动态扩张）
             其他参数与 GPT2Model 相同
 
         Returns:
@@ -141,6 +167,7 @@ class GPTWithGroup(nn.Module):
             loss: 若提供 labels，返回交叉熵损失
             manifold_distance: 平均流形距离（用于正则化）
             global_group_state: 全局群状态 (B, d, d)
+            expansion_info: 若启用动态扩张，返回扩张信息
         """
         # 关键设计：每一层 Transformer 块后立即应用群光滑层
         # 流程：for block, smooth in zip(blocks, smooth_layers):
@@ -183,6 +210,7 @@ class GPTWithGroup(nn.Module):
             self.group_d, dtype=hidden_states.dtype, device=device
         ).unsqueeze(0).expand(batch_size, -1, -1)
         manifold_distance = 0.0
+        expansion_info = None
 
         # 逐层处理：Transformer 块 + 群光滑层
         for i, (block, smooth_layer) in enumerate(zip(self.base_model.h, self.smooth_layers)):
@@ -213,6 +241,24 @@ class GPTWithGroup(nn.Module):
                 # 数值不稳定时回退到一阶近似
                 global_group_state = global_group_state @ (I_batch + delta_group_mean)
 
+        # 动态群扩张：在最后一层分析路径积分闭合
+        # 使用 global_group_state（路径积分结果）与 target_group_state 比较
+        if self.enable_dynamic_expansion and target_group_state is not None:
+            expander_output = self.expander(
+                hidden_states=hidden_states,
+                target_group_state=target_group_state,  # 用于计算 ΔG = G_final^{-1} · G_target
+                global_step=global_step,
+                global_group_state=global_group_state  # 传递路径积分累乘结果
+            )
+            expansion_info = {
+                'triggered': expander_output['expansion_triggered'],
+                'info': expander_output['expansion_info'],
+                'path_integral_error': expander_output.get('path_integral_error'),
+                'num_groups': expander_output['num_groups'],
+            }
+            if expansion_info['triggered']:
+                print(f"[GPTWithGroup] 触发群扩张！当前群数量：{expansion_info['num_groups']}")
+
         # 最终层归一化
         hidden_states = self.base_model.ln_f(hidden_states)
 
@@ -232,13 +278,19 @@ class GPTWithGroup(nn.Module):
 
         # 返回
         if not return_dict:
-            return (logits, manifold_distance, global_group_state) + (loss,) if loss is not None else (logits, manifold_distance, global_group_state)
+            result = (logits, manifold_distance, global_group_state)
+            if loss is not None:
+                result = result + (loss,)
+            if expansion_info is not None:
+                result = result + (expansion_info,)
+            return result
 
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=logits,
             manifold_distance=manifold_distance,
             global_group_state=global_group_state,
+            expansion_info=expansion_info,
         )
 
     def generate(
@@ -411,6 +463,7 @@ class CausalLMOutputWithCrossAttentions:
         logits: 语言模型输出 (B, S, vocab_size)
         manifold_distance: 平均流形距离（标量，用于正则化）
         global_group_state: 全局群状态 (B, d, d)
+        expansion_info: 动态群扩张信息（若启用）
     """
     loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
@@ -419,3 +472,4 @@ class CausalLMOutputWithCrossAttentions:
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     manifold_distance: Optional[torch.FloatTensor] = None
     global_group_state: Optional[torch.FloatTensor] = None
+    expansion_info: Optional[dict] = None

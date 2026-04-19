@@ -39,9 +39,11 @@ def cayley_exp(A: torch.Tensor) -> torch.Tensor:
     A_skew = 0.5 * (A - A.transpose(-1, -2))
 
     # 谱归一化：限制范数避免数值不稳定
+    # 使用更严格的阈值 0.5 防止梯度爆炸
     norm_A = torch.linalg.norm(A_skew, ord=2, dim=(-2, -1), keepdim=True)
-    scale = torch.clamp(norm_A, min=1e-6)
-    A_skew = torch.where(scale > 1.0, A_skew / scale, A_skew)
+    max_norm = 0.5  # 更严格的谱半径限制
+    scale = torch.clamp(norm_A, min=1e-8)
+    A_skew = torch.where(norm_A > max_norm, A_skew * (max_norm / scale), A_skew)
 
     # Cayley 变换
     d = A.shape[-1]
@@ -57,6 +59,10 @@ def cayley_exp(A: torch.Tensor) -> torch.Tensor:
     half_A = 0.5 * A_skew
     numerator = I_expanded + half_A
     denominator = I_expanded - half_A
+
+    # 添加小扰动防止分母奇异
+    eps = 1e-6
+    denominator = denominator + eps * I_expanded
 
     # 使用 solve 替代 inv 提高数值稳定性
     # (I - A/2)^{-1} @ (I + A/2) = solve(I - A/2, I + A/2)
