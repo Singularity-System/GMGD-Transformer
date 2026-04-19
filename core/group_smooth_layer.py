@@ -26,21 +26,28 @@ from .meta_group import MetaGroup
 
 class GroupSmoothLayer(nn.Module):
     """
-    群光滑层：将隐状态投影到群流形后残差连接
+    群光滑层：将隐状态投影到群流形后残差连接（带自适应机制）
 
     设计原则：
     1. 完全向量化实现，支持任意批量维度
     2. 残差连接避免破坏预训练权重
     3. 与 MetaGroup 解耦，可独立配置
+    4. **自适应学习**: 根据流形距离动态调整投影强度和残差权重
+
+    自适应机制：
+    - 可学习的残差权重 α = sigmoid(weight_alpha)，控制群光滑影响
+    - 自适应学习率：lr_adaptive = base_lr * (1 + manifold_distance)
+    - 门控投影：根据输入特征动态调整投影强度
 
     参数：
         hidden_dim: Transformer 隐层维度（如 768）
         group_d: 群表示维数 d（矩阵大小 d×d）
         meta_group: 关联的 MetaGroup 实例（可选，若不提供则自动创建）
         proj_steps: 投影梯度步数（通常 1，推理时可增至 3）
-        smooth_lr: 投影学习率（0.05–0.2）
+        smooth_lr: 投影基础学习率（0.05–0.2）
         num_generators: 若自动创建 MetaGroup，生成元个数
         group_type: 若自动创建 MetaGroup，群类型
+        adaptive: 是否启用自适应机制（默认 True）
 
     示例：
         >>> meta_group = MetaGroup(num_generators=12, d=32)
@@ -49,7 +56,8 @@ class GroupSmoothLayer(nn.Module):
         ...     group_d=32,
         ...     meta_group=meta_group,
         ...     proj_steps=1,
-        ...     smooth_lr=0.1
+        ...     smooth_lr=0.1,
+        ...     adaptive=True
         ... )
         >>> x = torch.randn(4, 128, 768)  # (batch, seq, hidden)
         >>> out = smooth_layer(x)  # (4, 128, 768)
@@ -63,7 +71,8 @@ class GroupSmoothLayer(nn.Module):
         proj_steps: int = 1,
         smooth_lr: float = 0.1,
         num_generators: int = 12,
-        group_type: str = 'orthogonal'
+        group_type: str = 'orthogonal',
+        adaptive: bool = True
     ):
         super().__init__()
 
@@ -71,6 +80,7 @@ class GroupSmoothLayer(nn.Module):
         self.group_d = group_d
         self.proj_steps = proj_steps
         self.smooth_lr = smooth_lr
+        self.adaptive = adaptive
 
         # 使用传入的 MetaGroup 或自动创建
         if meta_group is not None:
@@ -94,9 +104,24 @@ class GroupSmoothLayer(nn.Module):
         nn.init.normal_(self.proj_from.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.proj_from.bias)
 
+        # === 自适应机制 ===
+        if self.adaptive:
+            # 可学习的残差权重 α，控制群光滑的影响强度
+            # 使用 sigmoid 保证 α ∈ (0, 1)，初始化为 0.5
+            self.weight_alpha = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.5
+
+            # 门控网络：根据输入特征动态调整投影强度
+            # 输入：隐状态的统计特征 (mean, std)，输出：门控值 g ∈ (0, 1)
+            self.gate_network = nn.Sequential(
+                nn.Linear(2, 16),
+                nn.ReLU(),
+                nn.Linear(16, 1),
+                nn.Sigmoid()
+            )
+
     def forward(self, hidden_states: torch.Tensor) -> tuple:
         """
-        前向传播：群光滑操作
+        前向传播：自适应群光滑操作
 
         Args:
             hidden_states: Transformer 隐状态 (B, S, H) 或任意形状 (..., H)
@@ -126,20 +151,50 @@ class GroupSmoothLayer(nn.Module):
         # 重塑为 (B*S, d, d)
         matrices = matrix_flat.view(batch_size * seq_len, self.group_d, self.group_d)
 
+        # === 自适应机制 ===
+        if self.adaptive:
+            # 1. 计算输入统计特征用于门控
+            input_mean = matrices.mean(dim=(-2, -1), keepdim=True)  # (N, 1, 1)
+            input_std = matrices.std(dim=(-2, -1), keepdim=True)    # (N, 1, 1)
+
+            # 归一化统计特征
+            input_mean_norm = input_mean / (input_std + 1e-6)
+
+            # 批量处理门控网络输入
+            gate_input = torch.cat([
+                input_mean_norm.view(batch_size * seq_len, 1),
+                input_std.view(batch_size * seq_len, 1)
+            ], dim=-1)  # (N, 2)
+
+            # 计算门控值 (N, 1)
+            gate_value = self.gate_network(gate_input).view(batch_size * seq_len, 1, 1)
+
+            # 应用门控到输入矩阵
+            matrices_gated = gate_value * matrices
+
+            # 2. 计算自适应学习率基础值
+            # 流形距离越大，学习率越高（需要更多调整）
+            base_manifold_dist = torch.norm(matrices, dim=(-2, -1)).mean().detach()
+            adaptive_lr_factor = 1.0 + base_manifold_dist  # 动态缩放
+
+        else:
+            matrices_gated = matrices
+            adaptive_lr_factor = 1.0
+
         # 批量群投影：(B*S, d, d) → (B*S, d, d)
         # 完全向量化，无 Python 循环
         matrices_smooth = self.meta_group.project_to_manifold_batch(
-            matrices,
+            matrices_gated,
             num_steps=self.proj_steps,
-            lr=self.smooth_lr
+            lr=self.smooth_lr * adaptive_lr_factor  # 自适应学习率
         )
 
         # 计算群增量（光滑后 - 光滑前）— 该层对群流形的贡献
-        delta_group = matrices_smooth - matrices  # (B*S, d, d)
+        delta_group = matrices_smooth - matrices_gated  # (B*S, d, d)
 
         # 新增：计算流形距离（投影前后差异）
         # 这度量了 hidden 表征偏离群流形的程度
-        manifold_distance = torch.norm(matrices_smooth - matrices, dim=(-2, -1)).mean()
+        manifold_distance = torch.norm(matrices_smooth - matrices_gated, dim=(-2, -1)).mean()
 
         # 重塑回 (B, S, d*d)
         smooth_flat = matrices_smooth.view(batch_size, seq_len, -1)
@@ -148,8 +203,14 @@ class GroupSmoothLayer(nn.Module):
         # 反投影：(B, S, d*d) → (B, S, H)
         smooth_hidden = self.proj_from(smooth_flat)
 
-        # 残差连接
-        output = hidden_states + smooth_hidden
+        # === 自适应残差连接 ===
+        if self.adaptive:
+            # 使用可学习的权重 α 控制残差强度
+            alpha = torch.sigmoid(self.weight_alpha)
+            output = hidden_states + alpha * smooth_hidden
+        else:
+            # 标准残差连接
+            output = hidden_states + smooth_hidden
 
         # 恢复原始形状
         if squeeze_output:
@@ -191,12 +252,16 @@ class GroupSmoothLayer(nn.Module):
         self.proj_from.bias.requires_grad = True
 
     def extra_repr(self) -> str:
-        return (
+        repr_str = (
             f'hidden_dim={self.hidden_dim}, '
             f'group_d={self.group_d}, '
             f'proj_steps={self.proj_steps}, '
             f'smooth_lr={self.smooth_lr}'
         )
+        if self.adaptive:
+            alpha = torch.sigmoid(self.weight_alpha).item()
+            repr_str += f', adaptive=True, alpha={alpha:.3f}'
+        return repr_str
 
 
 class GroupSmoothLayerConfig:
