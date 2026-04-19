@@ -89,9 +89,9 @@ seq_len = 16
 input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
 
 with torch.no_grad():
-    # 获取基础隐藏状态
-    transformer_outputs = model.base_model.transformer(input_ids=input_ids)
-    hidden_states = transformer_outputs[0]
+    # 获取基础隐藏状态（GPT2Model 直接调用返回 last_hidden_state）
+    transformer_outputs = model.base_model(input_ids=input_ids)
+    hidden_states = transformer_outputs.last_hidden_state
 
     print(f"\n输入形状：{hidden_states.shape}")
 
