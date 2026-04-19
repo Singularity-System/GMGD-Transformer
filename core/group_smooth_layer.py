@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
-from meta_group import MetaGroup
+from .meta_group import MetaGroup
 
 
 class GroupSmoothLayer(nn.Module):

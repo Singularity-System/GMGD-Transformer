@@ -5,16 +5,15 @@
 """
 
 import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
 
 import torch
 
-print("=" * 60)
-print("测试全局群状态累乘机制（路径积分）")
-print("=" * 60)
-
-from gpt_with_group import GPTWithGroup
+from core import GPTWithGroup
 
 # 创建模型
 print("\n创建模型...")
