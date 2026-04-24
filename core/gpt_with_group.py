@@ -300,7 +300,19 @@ class GPTWithGroup(nn.Module):
                 else:
                     next_token = torch.argmax(logits, dim=-1, keepdim=True)
 
+                # 关键修复：在生成阶段屏蔽 PAD token（当 pad_token_id == eos_token_id 时）
+                # 训练数据中 PAD 占主导导致模型偏向预测 EOS
+                if pad_token_id == eos_token_id:
+                    logits_for_selection = logits.clone()
+                    logits_for_selection[:, pad_token_id] = float('-inf')
+                    if not do_sample:
+                        next_token = torch.argmax(logits_for_selection, dim=-1, keepdim=True)
+                    else:
+                        probs = torch.softmax(logits_for_selection, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)
+
                 # 检查哪些样本生成了 EOS
+                is_eos = (next_token.squeeze(-1) == eos_token_id)
                 is_eos = (next_token.squeeze(-1) == eos_token_id)
                 finished = finished | is_eos
 
