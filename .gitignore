@@ -48,3 +48,13 @@ Thumbs.db
 # Project specific
 edge_model/
 eval_results/
+
+# Large model files (GitHub 100MB limit)
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pb
+model_weights/

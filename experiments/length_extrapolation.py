@@ -250,7 +250,8 @@ def train_model(
     train_loader,
     epochs: int = 3,
     learning_rate: float = 1e-4,
-    group_lr: float = None,  # 群参数学习率（默认与主网络相同）
+    group_lr: float = None,  # 群参数学习率（生成元，高学习率）
+    proj_lr: float = None,  # 投影层学习率（中等学习率）
     manifold_loss_weight: float = 0.1,  # 流形对齐损失权重
     device: torch.device = None,
     save_path: str = None
@@ -262,16 +263,30 @@ def train_model(
 
     model = model.to(device)
 
-    # 参数分组：群参数用更高学习率
+    # 参数分组：三层学习率策略
+    # 1. meta_group 生成元：group_lr（高学习率，快速学习群公理）
+    # 2. 投影层 (proj_to/proj_from/gate/logit_alpha)：proj_lr（中等学习率，控制增长）
+    # 3. 其他参数：learning_rate（预训练权重，低学习率微调）
     if group_lr is not None and hasattr(model, 'meta_group'):
-        group_params = list(model.meta_group.parameters())
-        other_params = [p for n, p in model.named_parameters() if 'meta_group' not in n]
+        mg_params = set()
+        proj_params = set()
+        for n, p in model.named_parameters():
+            if 'meta_group' in n and 'generator_params' in n:
+                mg_params.add(id(p))
+            elif 'proj_to' in n or 'proj_from' in n or 'gate_network' in n or 'logit_alpha' in n or 'weight_alpha' in n:
+                proj_params.add(id(p))
+        other_params = [p for p in model.parameters() if id(p) not in mg_params and id(p) not in proj_params]
+        mg_list = [p for p in model.parameters() if id(p) in mg_params]
+        proj_list = [p for p in model.parameters() if id(p) in proj_params]
+
         param_groups = [
-            {'params': group_params, 'lr': group_lr},
-            {'params': other_params, 'lr': learning_rate}
+            {'params': mg_list, 'lr': group_lr},
         ]
+        if proj_list:
+            param_groups.append({'params': proj_list, 'lr': proj_lr or group_lr})
+        param_groups.append({'params': other_params, 'lr': learning_rate})
         optimizer = torch.optim.AdamW(param_groups)
-        print(f"优化器：群参数 lr={group_lr}, 其他 lr={learning_rate}, 流形损失权重={manifold_loss_weight}")
+        print(f"优化器：生成元 lr={group_lr}, 投影层 lr={proj_lr or group_lr}, 其他 lr={learning_rate}, 流形损失权重={manifold_loss_weight}")
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
@@ -585,14 +600,15 @@ def run_extrapolation_experiment(
     # 简单方案：使用 group_d 使得 d*d = hidden_dim
     # 但 768 不是完全平方数，所以我们需要修改 GroupSmoothLayer 支持非平方维度
 
-    # 训练（群参数用更高学习率，流形损失强制表征对齐）
+    # 训练（三层学习率策略）
     gmgd_losses = train_model(
         gmgd_model,
         train_loader,
         epochs=epochs,
         learning_rate=1e-4,
-        group_lr=5e-4,  # 群参数 5x 学习率
-        manifold_loss_weight=0.1,  # 流形损失权重 0.1（温和约束，避免损害语言能力）
+        group_lr=2e-3,  # 生成元 20x 学习率（学习群公理）
+        proj_lr=5e-4,  # 投影层 5x 学习率（控制增长，避免噪声爆炸）
+        manifold_loss_weight=0.5,  # 提高流形损失权重，增强群路径梯度信号
         save_path=os.path.join(save_dir, 'gmgd_model')
     )
     results['GMGD-1']['train_losses'] = gmgd_losses

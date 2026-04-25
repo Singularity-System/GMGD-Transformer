@@ -17,6 +17,7 @@ GroupSmoothLayer: 群光滑层
 - 预期加速：从 ~850ms 降至 ~12ms（单层前向，B=32, S=512）
 """
 
+import math
 import torch
 import torch.nn as nn
 from typing import Optional
@@ -97,20 +98,43 @@ class GroupSmoothLayer(nn.Module):
         self.proj_to = nn.Linear(hidden_dim, matrix_dim, bias=True)
         self.proj_from = nn.Linear(matrix_dim, hidden_dim, bias=True)
 
-        # 初始化：小噪声初始化（非零），让群层从一开始就参与学习
-        # 零初始化会导致梯度短路 — 模型会跳过群层直接学习
-        nn.init.normal_(self.proj_to.weight, mean=0.0, std=0.02)
+        # 投影层初始化策略：
+        # - proj_to: Kaiming 初始化，gain=0.1（小但不为零）
+        #   提供非零初始梯度信号，同时避免 alpha=1 时激活爆炸
+        #   gain=0.1 时投影范数 ≈ 0.92（旧方案 std=0.02 范数=8.87 的 1/10）
+        #   每层注入噪声 ≈ 0.05，12 层总计 ≈ 0.6，远小于预训练激活
+        # - proj_from: 零初始化，避免群路径在训练初期注入噪声
+        #   零初始化时 proj_from 仍可从流形损失获得非零梯度
+        # - alpha warm-up: 初始 alpha=1.0 提供强梯度信号
+        #   配合小 gain 的 proj_to，激活不会爆炸
+        nn.init.kaiming_uniform_(self.proj_to.weight, a=math.sqrt(5))
+        with torch.no_grad():
+            self.proj_to.weight.mul_(0.1)  # 缩小到 1/10，避免 warm-up 时激活爆炸
         nn.init.zeros_(self.proj_to.bias)
-        nn.init.normal_(self.proj_from.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.proj_from.weight)
         nn.init.zeros_(self.proj_from.bias)
 
         # === 自适应机制 ===
         if self.adaptive:
-            # 可学习的残差权重 α，控制群光滑的影响强度
-            # 使用 sigmoid 保证 α ∈ (0, 1)
-            # 初始化为 -2，sigmoid(-2)≈0.12，让群模块在训练初期保持弱影响
-            # 等 Transformer 先学会语言理解，再逐渐增强群约束
-            self.weight_alpha = nn.Parameter(torch.tensor(-2.0))  # sigmoid(-2) ≈ 0.12
+            # Alpha warm-up 机制：
+            # - 训练初期 (step < warmup_steps): alpha=0.2（提供足够梯度信号，
+            #   同时限制噪声注入避免激活爆炸）
+            # - 训练后期 (step >= warmup_steps): alpha 由模型自行学习
+            #   sigmoid(logit_alpha) 通常收敛到合理值
+            #
+            # 为什么需要 warm-up:
+            # proj_to 使用缩放 Kaiming 初始化 (范数 ≈ 0.92)，提供非零初始投影。
+            # proj_from 零初始化，从流形损失获得非零梯度。
+            # alpha=0.2 平衡：提供足够梯度信号推动学习，同时限制噪声注入。
+            #
+            # 旧方案 (random init std=0.02, alpha=0.5):
+            #   投影层范数锁定在 8.87，群层变成随机噪声
+            # 新方案 (scaled Kaiming, alpha=0.2 warmup):
+            #   投影层可学习，群层从静默逐步激活
+            self.logit_alpha = nn.Parameter(torch.tensor(-8.6))  # sigmoid(-8.6) ≈ 0.0002
+            self.register_buffer('warmup_steps', torch.tensor(2000))  # 延长 warm-up 步数
+            self.register_buffer('step_counter', torch.tensor(0))
+            self.register_buffer('warmup_alpha', torch.tensor(0.1))  # warm-up 阶段 alpha（控制噪声）
 
             # 门控网络：根据输入特征动态调整投影强度
             # 输入：隐状态的统计特征 (mean, std)，输出：门控值 g ∈ (0, 1)
@@ -123,7 +147,7 @@ class GroupSmoothLayer(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> tuple:
         """
-        前向传播：自适应群光滑操作
+        前向传播：自适应群光滑操作（带 Alpha Warm-up）
 
         Args:
             hidden_states: Transformer 隐状态 (B, S, H) 或任意形状 (..., H)
@@ -155,47 +179,43 @@ class GroupSmoothLayer(nn.Module):
 
         # === 自适应机制 ===
         if self.adaptive:
-            # 1. 计算输入统计特征用于门控
-            input_mean = matrices.mean(dim=(-2, -1), keepdim=True)  # (N, 1, 1)
-            input_std = matrices.std(dim=(-2, -1), keepdim=True)    # (N, 1, 1)
+            # 1. 裁剪输入矩阵避免数值溢出（Frobenius 范数限制）
+            matrix_norms = torch.linalg.norm(matrices, dim=(-2, -1), keepdim=True)
+            max_norm = 100.0
+            scaling = torch.clamp(matrix_norms, max=max_norm) / (matrix_norms + 1e-8)
+            matrices = matrices * scaling
 
-            # 归一化统计特征
+            # 2. 门控网络
+            input_mean = matrices.mean(dim=(-2, -1), keepdim=True)
+            input_std = matrices.std(dim=(-2, -1), keepdim=True)
             input_mean_norm = input_mean / (input_std + 1e-6)
-
-            # 批量处理门控网络输入
             gate_input = torch.cat([
                 input_mean_norm.view(batch_size * seq_len, 1),
                 input_std.view(batch_size * seq_len, 1)
-            ], dim=-1)  # (N, 2)
-
-            # 计算门控值 (N, 1)
+            ], dim=-1)
             gate_value = self.gate_network(gate_input).view(batch_size * seq_len, 1, 1)
-
-            # 应用门控到输入矩阵
             matrices_gated = gate_value * matrices
 
-            # 2. 移除自适应学习率放大因子
-            # 原因：在训练初期流形距离很大时会导致梯度爆炸
-            # 让优化器通过 weight_alpha 自然学习合适的强度
-            adaptive_lr_factor = 1.0
+            # 3. 自适应学习率（限制上限防止爆炸）
+            base_manifold_dist = torch.norm(matrices, dim=(-2, -1)).mean().detach()
+            adaptive_lr_factor = 1.0 + base_manifold_dist
+            adaptive_lr_factor = torch.clamp(adaptive_lr_factor, min=1.0, max=50.0)
 
         else:
             matrices_gated = matrices
             adaptive_lr_factor = 1.0
 
         # 批量群投影：(B*S, d, d) → (B*S, d, d)
-        # 完全向量化，无 Python 循环
         matrices_smooth = self.meta_group.project_to_manifold_batch(
             matrices_gated,
             num_steps=self.proj_steps,
-            lr=self.smooth_lr * adaptive_lr_factor  # 自适应学习率
+            lr=self.smooth_lr * adaptive_lr_factor
         )
 
         # 计算群增量（光滑后 - 光滑前）— 该层对群流形的贡献
-        delta_group = matrices_smooth - matrices_gated  # (B*S, d, d)
+        delta_group = matrices_smooth - matrices_gated
 
-        # 新增：计算流形距离（投影前后差异）
-        # 这度量了 hidden 表征偏离群流形的程度
+        # 流形距离（投影前后差异，度量 hidden 表征偏离群流形的程度）
         manifold_distance = torch.norm(matrices_smooth - matrices_gated, dim=(-2, -1)).mean()
 
         # 重塑回 (B, S, d*d)
@@ -205,13 +225,31 @@ class GroupSmoothLayer(nn.Module):
         # 反投影：(B, S, d*d) → (B, S, H)
         smooth_hidden = self.proj_from(smooth_flat)
 
-        # === 自适应残差连接 ===
+        # === Alpha Warm-up 残差连接 ===
         if self.adaptive:
-            # 使用可学习的权重 α 控制残差强度
-            alpha = torch.sigmoid(self.weight_alpha)
+            # Alpha warm-up 机制：
+            # - 训练初期 (step < warmup_steps): alpha=0.2（适中信号）
+            #   帮助 proj_to/proj_from 快速逃离零初始化状态
+            # - 训练后期 (step >= warmup_steps): alpha 由模型自行学习
+            #   sigmoid(logit_alpha) 通常收敛到合理值
+            #
+            # 为什么需要 warm-up:
+            # proj_to 使用 He 初始化提供非零初始投影，proj_from 零初始化。
+            # 训练初期 alpha=1 提供强梯度信号：
+            #   dL/dW_proj_from ∝ alpha * (matrices_smooth - matrices_gated)  ← 非零
+            #   dL/dW_proj_to   ∝ alpha * dL/dW_proj_from * gate * ...       ← 非零
+            # 随着生成元学习群公理，流形距离提供额外信号。
+            if self.training:
+                with torch.no_grad():
+                    self.step_counter.add_(1)
+
+            warmup_progress = (self.step_counter.float() / self.warmup_steps.float()).clamp(0.0, 1.0)
+            learned_alpha = torch.sigmoid(self.logit_alpha)
+            # warm-up 阶段：alpha 从 warmup_alpha (0.2) 线性衰减到 learned_alpha
+            alpha = (1.0 - warmup_progress) * self.warmup_alpha + warmup_progress * learned_alpha
+
             output = hidden_states + alpha * smooth_hidden
         else:
-            # 标准残差连接
             output = hidden_states + smooth_hidden
 
         # 恢复原始形状
@@ -261,8 +299,11 @@ class GroupSmoothLayer(nn.Module):
             f'smooth_lr={self.smooth_lr}'
         )
         if self.adaptive:
-            alpha = torch.sigmoid(self.weight_alpha).item()
-            repr_str += f', adaptive=True, alpha={alpha:.3f}'
+            warmup_progress = min(self.step_counter.item() / max(self.warmup_steps.item(), 1), 1.0)
+            learned_alpha = torch.sigmoid(self.logit_alpha).item()
+            warmup_a = self.warmup_alpha.item()
+            effective_alpha = (1.0 - warmup_progress) * warmup_a + warmup_progress * learned_alpha
+            repr_str += f', adaptive=True, alpha={effective_alpha:.3f}, learned={learned_alpha:.3f}, warmup={warmup_progress:.1%}'
         return repr_str
 
 
