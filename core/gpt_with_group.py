@@ -6,12 +6,18 @@ GPTWithGroup: 群扩展 GPT 模型
 - 每一 Transformer 块后追加 GroupSmoothLayer（共 N 层）
 - 语言模型头与词嵌入权重共享
 - 路径积分机制：全局群状态累乘
+- 多群架构：DynamicGroupExpander 自动管理多个 MetaGroup
 
 构建方式：
+    # 单群模式
+    model = GPTWithGroup(base_model_name='gpt2', group_d=32, num_generators=12)
+
+    # 多群模式
     model = GPTWithGroup(
         base_model_name='gpt2',
-        group_d=32,
-        num_generators=12
+        group_d=16,
+        num_generators=6,
+        enable_dynamic_expansion=True
     )
 
 前向传播流程：
@@ -53,6 +59,7 @@ class GPTWithGroup(nn.Module):
         use_pretrained: 是否使用预训练权重
         enable_dynamic_expansion: 是否启用动态群扩张
         expansion_threshold: 路径积分闭合误差阈值（超过则触发扩张）
+        max_generators_per_group: 单群最大生成元数
     """
 
     def __init__(
@@ -76,21 +83,20 @@ class GPTWithGroup(nn.Module):
         self.group_type = group_type
         self.enable_dynamic_expansion = enable_dynamic_expansion
 
-        # 加载基础 GPT-2 模型（使用 GPT2Model 以便在每一层后插入群光滑层）
+        # 加载基础 GPT-2 模型
         if use_pretrained:
             self.base_model = GPT2Model.from_pretrained(base_model_name)
         else:
             config = GPT2Config.from_pretrained(base_model_name)
             self.base_model = GPT2Model(config)
 
-        # 获取模型配置
         self.config = self.base_model.config
-        self.hidden_dim = self.config.n_embd  # 768 for gpt2, 1024 for gpt2-medium
-        self.num_layers = self.config.n_layer  # 12 for gpt2, 24 for gpt2-medium
-        self.vocab_size = self.config.vocab_size  # 50257
+        self.hidden_dim = self.config.n_embd
+        self.num_layers = self.config.n_layer
+        self.vocab_size = self.config.vocab_size
 
-        # 动态群扩张模式
         if enable_dynamic_expansion:
+            # 多群模式：DynamicGroupExpander 内含 SubGroupManager + DomainRouter
             self.expander = DynamicGroupExpander(
                 hidden_dim=self.hidden_dim,
                 initial_group_d=group_d,
@@ -99,18 +105,19 @@ class GPTWithGroup(nn.Module):
                 threshold=expansion_threshold,
                 max_generators_per_group=max_generators_per_group
             )
-            # 所有层共享同一个 expander（包含 registry 和 router）
+            # 所有层共享初始群 'group_0'（SubGroupManager 默认创建）
             self.smooth_layers = nn.ModuleList([
                 GroupSmoothLayer(
                     hidden_dim=self.hidden_dim,
                     group_d=group_d,
-                    meta_group=self.expander.registry.groups['default'],
+                    meta_group=self.expander.registry.groups['group_0'],
                     proj_steps=proj_steps,
                     smooth_lr=smooth_lr,
                     adaptive=True
                 )
                 for _ in range(self.num_layers)
             ])
+            self.meta_group = None  # 多群模式下无共享 meta_group
         else:
             # 单群模式（向后兼容）
             self.expander = None
@@ -125,14 +132,14 @@ class GPTWithGroup(nn.Module):
                     group_d=group_d,
                     meta_group=self.meta_group,
                     proj_steps=proj_steps,
-                    smooth_lr=smooth_lr
+                    smooth_lr=smooth_lr,
+                    adaptive=False
                 )
                 for _ in range(self.num_layers)
             ])
 
         # 语言模型头（与词嵌入共享权重）
         self.lm_head = nn.Linear(self.hidden_dim, self.vocab_size, bias=False)
-        # 绑定权重（GPT2Model 的 wte）
         self.lm_head.weight = self.base_model.wte.weight
 
     def forward(
@@ -146,10 +153,10 @@ class GPTWithGroup(nn.Module):
         labels: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = True,  # 默认返回 dict 格式
-        target_group_state: Optional[torch.Tensor] = None,  # 用于路径积分闭合分析
-        global_step: int = 0,  # 当前训练步数
-        expansion_warmup_steps: int = 50,  # 扩张 warmup 步数
+        return_dict: Optional[bool] = True,
+        target_group_state: Optional[torch.Tensor] = None,
+        global_step: int = 0,
+        expansion_warmup_steps: int = 50,
     ) -> Union[Tuple[torch.Tensor], dict]:
         """
         前向传播
@@ -160,44 +167,32 @@ class GPTWithGroup(nn.Module):
             labels: 标签（用于计算损失）
             target_group_state: 目标群状态 (B, d, d)，用于路径积分闭合分析
             global_step: 当前训练步数（用于动态扩张）
-            其他参数与 GPT2Model 相同
+            expansion_warmup_steps: 扩张 warmup 步数
 
         Returns:
-            logits: 语言模型输出 (B, S, vocab_size)
-            loss: 若提供 labels，返回交叉熵损失
-            manifold_distance: 平均流形距离（用于正则化）
-            global_group_state: 全局群状态 (B, d, d)
-            expansion_info: 若启用动态扩张，返回扩张信息
+            CausalLMOutputWithCrossAttentions with:
+                loss: 语言模型损失
+                logits: (B, S, vocab_size)
+                manifold_distance: 平均流形距离
+                global_group_state: (B, d, d)
+                router_loss: 路由辅助损失（多群模式下）
+                expansion_info: 扩张信息（多群模式下）
         """
-        # 关键设计：每一层 Transformer 块后立即应用群光滑层
-        # 流程：for block, smooth in zip(blocks, smooth_layers):
-        #           x = block(x, attention_mask)[0]
-        #           x = smooth(x)
-        #       x = ln_f(x)
-        #       return lm_head(x)
-
-        # 获取词嵌入和位置嵌入
         device = input_ids.device if input_ids is not None else inputs_embeds.device
 
         if input_ids is not None:
-            input_shape = input_ids.size()
-            batch_size, seq_len = input_shape
+            batch_size, seq_len = input_ids.shape
         else:
-            input_shape = inputs_embeds.size()[:-1]
-            batch_size, seq_len = input_shape
+            batch_size, seq_len = inputs_embeds.shape[:2]
 
-        # 生成 position_ids（GPT2Model 没有 position_ids 属性，需要手动创建）
         if position_ids is None:
             position_ids = torch.arange(seq_len, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
-        # 初始嵌入
-        if inputs_embeds is None:
-            inputs_embeds = self.base_model.wte(input_ids)
+        inputs_embeds = self.base_model.wte(input_ids)
         position_embeds = self.base_model.wpe(position_ids)
         hidden_states = inputs_embeds + position_embeds
 
-        # 注意力掩码
         if attention_mask is not None:
             attention_mask = attention_mask.view(batch_size, -1)
             extended_attention_mask = attention_mask[:, None, None, :]
@@ -205,29 +200,24 @@ class GPTWithGroup(nn.Module):
         else:
             extended_attention_mask = None
 
-        # 初始化全局群状态
         global_group_state = torch.eye(
             self.group_d, dtype=hidden_states.dtype, device=device
         ).unsqueeze(0).expand(batch_size, -1, -1)
         manifold_distance = 0.0
         expansion_info = None
+        router_loss = None
 
         # 逐层处理：Transformer 块 + 群光滑层
         for i, (block, smooth_layer) in enumerate(zip(self.base_model.h, self.smooth_layers)):
-            # Transformer 块（GPT2Block 返回张量，不是 tuple）
             hidden_states = block(hidden_states, attention_mask=extended_attention_mask)
-
-            # 群光滑层
             hidden_states, layer_manifold_dist, delta_group = smooth_layer(hidden_states)
             manifold_distance += layer_manifold_dist
 
-            # 路径积分：累乘群增量（使用 Cayley 变换）
-            # delta_group: (B, S, d, d) → mean(dim=1) → (B, d, d)
+            # 路径积分
             delta_group_mean = delta_group.mean(dim=1)
             delta_skew = 0.5 * (delta_group_mean - delta_group_mean.transpose(-2, -1))
             half_delta = 0.5 * delta_skew
 
-            # Cayley 变换：exp(delta) ≈ (I + delta/2) @ (I - delta/2)^{-1}
             I = torch.eye(self.group_d, dtype=hidden_states.dtype, device=device)
             I_batch = I.unsqueeze(0).expand(batch_size, -1, -1)
             numerator = I_batch + half_delta
@@ -238,34 +228,35 @@ class GPTWithGroup(nn.Module):
                 exp_delta = numerator @ denominator_inv
                 global_group_state = global_group_state @ exp_delta
             except RuntimeError:
-                # 数值不稳定时回退到一阶近似
                 global_group_state = global_group_state @ (I_batch + delta_group_mean)
 
-        # 动态群扩张：在最后一层分析路径积分闭合
-        # 使用 global_group_state（路径积分结果）与 target_group_state 比较
-        if self.enable_dynamic_expansion and target_group_state is not None:
+        # 动态群扩张分析
+        if self.enable_dynamic_expansion:
+            # 始终调用 expander 获取 router_loss（即使未到 expansion warmup）
+            target_gs = target_group_state if global_step >= expansion_warmup_steps else None
             expander_output = self.expander(
                 hidden_states=hidden_states,
-                target_group_state=target_group_state,  # 用于计算 ΔG = G_final^{-1} · G_target
+                target_group_state=target_gs,
                 global_step=global_step,
-                global_group_state=global_group_state  # 传递路径积分累乘结果
+                global_group_state=global_group_state
             )
-            expansion_info = {
-                'triggered': expander_output['expansion_triggered'],
-                'info': expander_output['expansion_info'],
-                'path_integral_error': expander_output.get('path_integral_error'),
-                'num_groups': expander_output['num_groups'],
-            }
-            if expansion_info['triggered']:
-                print(f"[GPTWithGroup] 触发群扩张！当前群数量：{expansion_info['num_groups']}")
+            router_loss = expander_output.get('router_loss')
+
+            if global_step >= expansion_warmup_steps and target_group_state is not None:
+                expansion_info = {
+                    'triggered': expander_output['expansion_triggered'],
+                    'info': expander_output['expansion_info'],
+                    'path_integral_error': expander_output.get('path_integral_error'),
+                    'num_groups': expander_output['num_groups'],
+                }
+                if expansion_info['triggered']:
+                    print(f"[GPTWithGroup] 触发群扩张！当前群数量：{expansion_info['num_groups']}")
 
         # 最终层归一化
         hidden_states = self.base_model.ln_f(hidden_states)
-
-        # 平均流形距离
         manifold_distance = manifold_distance / len(self.smooth_layers)
 
-        # 计算语言模型 logits
+        # 语言模型 logits
         logits = self.lm_head(hidden_states)
 
         # 计算损失
@@ -276,11 +267,12 @@ class GPTWithGroup(nn.Module):
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
 
-        # 返回
         if not return_dict:
             result = (logits, manifold_distance, global_group_state)
             if loss is not None:
                 result = result + (loss,)
+            if router_loss is not None:
+                result = result + (router_loss,)
             if expansion_info is not None:
                 result = result + (expansion_info,)
             return result
@@ -290,6 +282,7 @@ class GPTWithGroup(nn.Module):
             logits=logits,
             manifold_distance=manifold_distance,
             global_group_state=global_group_state,
+            router_loss=router_loss,
             expansion_info=expansion_info,
         )
 
@@ -305,41 +298,24 @@ class GPTWithGroup(nn.Module):
         eos_token_id: Optional[int] = None,
         **kwargs
     ) -> torch.LongTensor:
-        """
-        文本生成（自回归贪婪/采样解码）
-
-        Args:
-            input_ids: 输入 prompt 的 token ID (B, S)
-            max_length: 最大生成长度
-            max_new_tokens: 最大新生成 token 数（优先于 max_length）
-            do_sample: 是否采样
-            temperature: 采样温度
-            top_k: Top-k 采样
-            pad_token_id: PAD token ID
-            eos_token_id: EOS token ID
-
-        Returns:
-            生成的 token ID 序列 (B, L)
-        """
+        """文本生成（自回归贪婪/采样解码）"""
         if max_new_tokens is not None:
             max_length = input_ids.shape[1] + max_new_tokens
 
         self.eval()
         generated = input_ids.clone()
 
-        # 获取 EOS token ID
         if eos_token_id is None:
             eos_token_id = self.config.eos_token_id
         if pad_token_id is None:
-            pad_token_id = self.config.eos_token_id  # GPT-2 默认 PAD = EOS
+            pad_token_id = self.config.eos_token_id
 
-        # 跟踪每个样本是否已结束
         batch_size = generated.shape[0]
         finished = torch.zeros(batch_size, dtype=torch.bool, device=generated.device)
 
         with torch.no_grad():
             while generated.shape[1] < max_length:
-                outputs = self(generated[:, -1024:])  # GPT-2 上下文窗口限制
+                outputs = self(generated[:, -1024:])
                 logits = outputs.logits[:, -1, :]
 
                 if do_sample:
@@ -352,8 +328,7 @@ class GPTWithGroup(nn.Module):
                 else:
                     next_token = torch.argmax(logits, dim=-1, keepdim=True)
 
-                # 关键修复：在生成阶段屏蔽 PAD token（当 pad_token_id == eos_token_id 时）
-                # 训练数据中 PAD 占主导导致模型偏向预测 EOS
+                # 屏蔽 PAD token（pad==eos 时避免提前终止）
                 if pad_token_id == eos_token_id:
                     logits_for_selection = logits.clone()
                     logits_for_selection[:, pad_token_id] = float('-inf')
@@ -363,48 +338,35 @@ class GPTWithGroup(nn.Module):
                         probs = torch.softmax(logits_for_selection, dim=-1)
                         next_token = torch.multinomial(probs, num_samples=1)
 
-                # 检查哪些样本生成了 EOS
-                is_eos = (next_token.squeeze(-1) == eos_token_id)
                 is_eos = (next_token.squeeze(-1) == eos_token_id)
                 finished = finished | is_eos
 
-                # 已结束的样本保持 PAD token
                 next_token = next_token.masked_fill(
-                    finished.unsqueeze(-1),
-                    pad_token_id
+                    finished.unsqueeze(-1), pad_token_id
                 )
-
                 generated = torch.cat([generated, next_token], dim=1)
 
-                # 如果所有样本都结束了，停止生成
                 if finished.all():
                     break
 
         return generated
 
     def get_num_params(self) -> int:
-        """获取模型总参数数量"""
         return sum(p.numel() for p in self.parameters())
 
     def get_meta_group(self) -> MetaGroup:
-        """获取关联的 MetaGroup 模块"""
-        return self.meta_group
+        """获取关联的 MetaGroup（单群模式）"""
+        if self.meta_group is not None:
+            return self.meta_group
+        if self.expander is not None:
+            return self.expander.registry.groups['group_0']
+        return None
 
     def get_smooth_layers(self) -> nn.ModuleList:
-        """获取所有群光滑层"""
         return self.smooth_layers
 
     @classmethod
     def from_config(cls, config: dict) -> 'GPTWithGroup':
-        """
-        从配置字典创建模型
-
-        Args:
-            config: 配置字典，包含 base_model_name, group_d 等
-
-        Returns:
-            GPTWithGroup 实例
-        """
         return cls(
             base_model_name=config.get('base_model_name', 'gpt2'),
             group_d=config.get('group_d', 32),
@@ -412,70 +374,62 @@ class GPTWithGroup(nn.Module):
             group_type=config.get('group_type', 'orthogonal'),
             proj_steps=config.get('proj_steps', 1),
             smooth_lr=config.get('smooth_lr', 0.1),
-            use_pretrained=config.get('use_pretrained', True)
+            use_pretrained=config.get('use_pretrained', True),
+            enable_dynamic_expansion=config.get('enable_dynamic_expansion', False),
         )
 
     def save_pretrained(self, save_dir: str) -> None:
-        """
-        保存模型（包括 MetaGroup 状态）
-
-        Args:
-            save_dir: 保存目录
-        """
-        # 保存基础模型
+        """保存模型（包括群相关参数）"""
         self.base_model.save_pretrained(save_dir)
 
-        # 保存群相关参数
-        state_dict = {
-            'meta_group': self.meta_group.state_dict(),
-            'smooth_layers': self.smooth_layers.state_dict(),
-            'lm_head': self.lm_head.state_dict(),
-        }
+        if self.enable_dynamic_expansion and self.expander is not None:
+            state_dict = {
+                'expander': self.expander.state_dict(),
+                'smooth_layers': self.smooth_layers.state_dict(),
+                'lm_head': self.lm_head.state_dict(),
+            }
+        else:
+            state_dict = {
+                'meta_group': self.meta_group.state_dict(),
+                'smooth_layers': self.smooth_layers.state_dict(),
+                'lm_head': self.lm_head.state_dict(),
+            }
         torch.save(state_dict, f'{save_dir}/group_state.pt')
 
     @classmethod
     def load_pretrained(cls, load_dir: str, device: torch.device = None) -> 'GPTWithGroup':
-        """
-        加载预训练模型
-
-        Args:
-            load_dir: 模型目录
-            device: 加载设备
-
-        Returns:
-            GPTWithGroup 实例
-        """
         if device is None:
             device = torch.device('cpu')
 
-        # 创建模型
         model = cls(
             base_model_name=load_dir,
             use_pretrained=True
         )
 
-        # 加载群相关参数
         group_state = torch.load(f'{load_dir}/group_state.pt', map_location=device)
-        model.meta_group.load_state_dict(group_state['meta_group'])
+
+        if 'meta_group' in group_state:
+            model.meta_group.load_state_dict(group_state['meta_group'])
+        if 'expander' in group_state:
+            model.expander.load_state_dict(group_state['expander'])
         model.smooth_layers.load_state_dict(group_state['smooth_layers'])
         model.lm_head.load_state_dict(group_state['lm_head'])
 
         return model.to(device)
 
 
-# 兼容 transformers 的输出类型
 @dataclass
 class CausalLMOutputWithCrossAttentions:
     """
     简化的 CausalLMOutputWithCrossAttentions 实现
-    （避免直接依赖 transformers 的内部类型）
 
     属性：
-        loss: 语言模型损失（若提供 labels）
-        logits: 语言模型输出 (B, S, vocab_size)
-        manifold_distance: 平均流形距离（标量，用于正则化）
-        global_group_state: 全局群状态 (B, d, d)
-        expansion_info: 动态群扩张信息（若启用）
+        loss: 语言模型损失
+        logits: (B, S, vocab_size)
+        manifold_distance: 平均流形距离
+        global_group_state: (B, d, d)
+        router_loss: 路由辅助损失（多群模式）
+        expansion_info: 扩张信息（多群模式）
     """
     loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
@@ -484,4 +438,5 @@ class CausalLMOutputWithCrossAttentions:
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     manifold_distance: Optional[torch.FloatTensor] = None
     global_group_state: Optional[torch.FloatTensor] = None
+    router_loss: Optional[torch.FloatTensor] = None
     expansion_info: Optional[dict] = None

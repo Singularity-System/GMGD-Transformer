@@ -5,6 +5,11 @@
 1. 监控路径积分闭合误差
 2. 当误差超过阈值时，触发代数相容性测试
 3. 根据测试结果：吸收（扩展现有群）或 分裂（创建新群）
+
+改进点：
+- 使用重构后的 GroupRegistry（含 SubGroupManager + DomainRouter）
+- 改进扩张触发逻辑：结合路径积分误差和任务性能
+- 新增群初始化时使用 QR 分解或反对称化确保正交性
 """
 
 import torch
@@ -27,6 +32,7 @@ class DynamicGroupExpander(nn.Module):
         group_type: 群类型
         threshold: 路径积分闭合误差阈值
         max_generators_per_group: 单群最大生成元数量
+        min_steps_between_expansion: 两次扩张的最小间隔步数
     """
 
     def __init__(
@@ -36,7 +42,8 @@ class DynamicGroupExpander(nn.Module):
         initial_num_generators: int = 6,
         group_type: str = 'orthogonal',
         threshold: float = 0.5,
-        max_generators_per_group: int = 12
+        max_generators_per_group: int = 12,
+        min_steps_between_expansion: int = 50
     ):
         super().__init__()
 
@@ -46,7 +53,7 @@ class DynamicGroupExpander(nn.Module):
         self.group_type = group_type
         self.max_generators_per_group = max_generators_per_group
 
-        # 群注册表
+        # 群注册表（已包含 SubGroupManager + DomainRouter）
         self.registry = GroupRegistry(
             hidden_dim=hidden_dim,
             initial_group_d=initial_group_d,
@@ -64,16 +71,16 @@ class DynamicGroupExpander(nn.Module):
         self.expansion_history: List[dict] = []
 
         # 控制参数
-        self.compatibility_threshold = 0.1  # 代数相容性阈值
-        self.min_steps_between_expansion = 50  # 两次扩张的最小间隔步数（降低以允许早期扩张）
-        self.last_expansion_step = -self.min_steps_between_expansion * 2  # 初始延迟更长
+        self.compatibility_threshold = 0.1
+        self.min_steps_between_expansion = min_steps_between_expansion
+        self.last_expansion_step = -self.min_steps_between_expansion * 2
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         target_group_state: Optional[torch.Tensor] = None,
         global_step: int = 0,
-        global_group_state: Optional[torch.Tensor] = None  # 新增：路径积分累乘结果
+        global_group_state: Optional[torch.Tensor] = None
     ) -> dict:
         """
         前向传播：路由 + 可能的群扩张
@@ -87,25 +94,22 @@ class DynamicGroupExpander(nn.Module):
         Returns:
             output: 包含路由结果和扩张信息
         """
-        # 1. 获取当前路由结果
-        router_output = self.registry(hidden_states, target_group_state)
+        # 路由结果
+        router_output = self.registry(
+            hidden_states,
+            target_group_state=target_group_state,
+            global_group_state=global_group_state
+        )
 
-        # 2. 如果提供目标状态，分析路径积分闭合
+        # 扩张检测
         expansion_triggered = False
         expansion_info = None
 
         if target_group_state is not None and global_group_state is not None:
-            # 使用路径积分累乘结果进行分析
-            G_final = global_group_state
+            analysis = self.analyzer(global_group_state, target_group_state)
 
-            # 分析闭合误差
-            analysis = self.analyzer(G_final, target_group_state)
-
-            # 判断是否需要扩张
             if analysis.needs_new_group:
-                # 检查间隔
                 if global_step - self.last_expansion_step >= self.min_steps_between_expansion:
-                    # 执行扩张流程
                     expansion_info = self._attempt_expansion(
                         analysis.candidate_generator,
                         global_step
@@ -139,12 +143,12 @@ class DynamicGroupExpander(nn.Module):
         d = candidate_generator.shape[0]
         device = candidate_generator.device
 
-        # 1. 获取现有生成元列表
+        # 获取现有生成元列表
         existing_generators = []
         for group_id, group in self.registry.groups.items():
             existing_generators.extend(group.all_generators().unbind(0))
 
-        # 2. 测试代数相容性
+        # 测试代数相容性
         compatible, relation_loss = self.analyzer.test_algebraic_compatibility(
             candidate_generator,
             existing_generators,
@@ -160,91 +164,63 @@ class DynamicGroupExpander(nn.Module):
         }
 
         if compatible:
-            # 吸收：将候选生成元加入现有群（如果还有空间）
-            # 找到生成元最少的群
+            # 吸收：加入生成元最少的群
             target_group_id = min(
                 self.registry.groups.keys(),
                 key=lambda gid: self.registry.group_metadata[gid]['num_generators']
             )
             target_group = self.registry.groups[target_group_id]
+            current_n = len(target_group.generator_params)
 
-            # 检查是否还能添加生成元
-            current_num_generators = len(target_group.generator_params)
-            if current_num_generators < self.max_generators_per_group:
-                # 吸收逻辑：扩展生成元参数
+            if current_n < self.max_generators_per_group:
                 self._absorb_generator(target_group, candidate_generator)
                 expansion_info['action'] = 'absorb'
                 expansion_info['target_group'] = target_group_id
-                print(f"[DynamicGroupExpander] 吸收：将候选生成元加入群 {target_group_id}")
+                print(f"[DynamicGroupExpander] 吸收候选生成元到 {target_group_id}")
             else:
-                # 群已满，创建新群
                 expansion_info['action'] = 'split'
                 self._create_new_group(candidate_generator, global_step)
-                print(f"[DynamicGroupExpander] 分裂：创建新群（群 {target_group_id} 已满）")
+                print(f"[DynamicGroupExpander] 分裂：群已满，创建新群")
         else:
-            # 分裂：创建新群
             expansion_info['action'] = 'split'
             self._create_new_group(candidate_generator, global_step)
-            print(f"[DynamicGroupExpander] 分裂：候选生成元与现有群不相容，创建新群")
+            print(f"[DynamicGroupExpander] 分裂：候选与现有群不相容，创建新群")
 
-        # 更新最后扩张时间
         self.last_expansion_step = global_step
-
-        # 记录历史
         self.expansion_history.append(expansion_info)
-
         return expansion_info
 
     def _absorb_generator(self, group: nn.Module, candidate: torch.Tensor):
         """吸收候选生成元到现有群"""
-        d = candidate.shape[0]
-
-        # 创建新的生成元参数
         new_param = nn.Parameter(candidate.clone())
-
-        # 扩展 generator_params
         old_params = group.generator_params
-        new_params = nn.Parameter(torch.cat([
-            old_params.data,
-            new_param.unsqueeze(0)
-        ], dim=0))
-
+        new_params = nn.Parameter(torch.cat([old_params.data, new_param.unsqueeze(0)], dim=0))
         group.generator_params = new_params
 
-        # 更新元数据
         group_id = [gid for gid, g in self.registry.groups.items() if g == group][0]
         self.registry.group_metadata[group_id]['num_generators'] += 1
 
     def _create_new_group(self, candidate: torch.Tensor, global_step: int):
-        """创建新群"""
+        """创建新群（带正交初始化）"""
         d = candidate.shape[0]
-
-        # 生成新群 ID
         new_group_id = f"group_{self.registry.num_groups}"
+        num_generators = 1
 
-        # 以候选生成元为核心初始化新群
-        # 简化实现：使用候选矩阵作为第一个生成元的基础
-        num_generators = 1  # 新群初始只有 1 个生成元
-
-        # 注册新群（会自动扩展路由器）
+        # 注册新群（自动扩展路由器）
         self.registry.register_new_group(
             group_id=new_group_id,
             group_d=d,
             num_generators=num_generators
         )
 
-        # 初始化新群的生成元
+        # 正交初始化
         new_group = self.registry.groups[new_group_id]
-
-        # 使用候选矩阵初始化第一个生成元（正交化）
-        # 通过 QR 分解获得正交矩阵
         try:
-            Q, R = torch.linalg.qr(candidate)
+            Q, _ = torch.linalg.qr(candidate)
             new_group.generator_params.data[0] = Q
-        except:
-            # QR 失败，使用反对称化
+        except RuntimeError:
             skew = 0.5 * (candidate - candidate.transpose(-2, -1))
-            new_group.generator_params.data[0] = skew / (torch.norm(skew) + 1e-6) * 0.5
+            new_group.generator_params.data[0] = skew / (skew.norm() + 1e-6) * 0.5
 
         self.registry.group_metadata[new_group_id]['created_at_step'] = global_step
 
@@ -255,7 +231,8 @@ class DynamicGroupExpander(nn.Module):
             'group_ids': self.registry.get_group_ids(),
             'path_integral_stats': self.analyzer.get_statistics(),
             'num_expansions': len(self.expansion_history),
-            'last_expansion_step': self.last_expansion_step
+            'last_expansion_step': self.last_expansion_step,
+            'registry_stats': self.registry.get_statistics(),
         }
 
     def reset(self):
