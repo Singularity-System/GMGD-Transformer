@@ -6,7 +6,7 @@ GPTWithGroup: 群扩展 GPT 模型
 - 每一 Transformer 块后追加 GroupSmoothLayer（共 N 层）
 - 语言模型头与词嵌入权重共享
 - 路径积分机制：全局群状态累乘
-- 多群架构：DynamicGroupExpander 自动管理多个 MetaGroup
+- 多群架构：DynamicGroupExpander 自动管理 MetaGroup + GroupAttention
 
 构建方式：
     # 单群模式
@@ -31,12 +31,16 @@ GPTWithGroup: 群扩展 GPT 模型
     return lm_head(x)
 """
 
+import json
+import os
+
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple, List, Union
 from transformers import GPT2Model, GPT2Config
 
 from .meta_group import MetaGroup
+from .group_attention import GroupAttention
 from .group_smooth_layer import GroupSmoothLayer
 from .dynamic_expander import DynamicGroupExpander
 from dataclasses import dataclass
@@ -47,7 +51,7 @@ class GPTWithGroup(nn.Module):
     群扩展 GPT-2 模型（支持动态群扩张）
 
     在标准 GPT-2 的每一层后添加 GroupSmoothLayer，将隐状态投影到群流形。
-    使用 DynamicGroupExpander 自动管理多个 MetaGroup 实例。
+    使用 DynamicGroupExpander 自动管理 MetaGroup + GroupAttention。
 
     参数：
         base_model_name: 基础 GPT-2 模型名称 ('gpt2', 'gpt2-medium', 'gpt2-large')
@@ -59,7 +63,7 @@ class GPTWithGroup(nn.Module):
         use_pretrained: 是否使用预训练权重
         enable_dynamic_expansion: 是否启用动态群扩张
         expansion_threshold: 路径积分闭合误差阈值（超过则触发扩张）
-        max_generators_per_group: 单群最大生成元数
+        max_generators_per_group: 单子群最大生成元数
     """
 
     def __init__(
@@ -96,7 +100,7 @@ class GPTWithGroup(nn.Module):
         self.vocab_size = self.config.vocab_size
 
         if enable_dynamic_expansion:
-            # 多群模式：DynamicGroupExpander 内含 SubGroupManager + DomainRouter
+            # 多群模式：DynamicGroupExpander 内含 MetaGroup + GroupAttention
             self.expander = DynamicGroupExpander(
                 hidden_dim=self.hidden_dim,
                 initial_group_d=group_d,
@@ -105,15 +109,15 @@ class GPTWithGroup(nn.Module):
                 threshold=expansion_threshold,
                 max_generators_per_group=max_generators_per_group
             )
-            # 所有层共享初始群 'group_0'（SubGroupManager 默认创建）
+            # 所有层共享同一个 MetaGroup + GroupAttention
+            shared_meta_group = self.expander.meta_group
+            shared_attention = self.expander.attention
             self.smooth_layers = nn.ModuleList([
                 GroupSmoothLayer(
-                    hidden_dim=self.hidden_dim,
-                    group_d=group_d,
-                    meta_group=self.expander.registry.groups['group_0'],
+                    meta_group=shared_meta_group,
+                    attention=shared_attention,
                     proj_steps=proj_steps,
                     smooth_lr=smooth_lr,
-                    adaptive=True
                 )
                 for _ in range(self.num_layers)
             ])
@@ -126,14 +130,17 @@ class GPTWithGroup(nn.Module):
                 d=group_d,
                 group_type=group_type
             )
+            # 为单群模式创建共享注意力
+            self.single_attention = GroupAttention(
+                hidden_dim=self.hidden_dim,
+                num_groups=1,
+            )
             self.smooth_layers = nn.ModuleList([
                 GroupSmoothLayer(
-                    hidden_dim=self.hidden_dim,
-                    group_d=group_d,
                     meta_group=self.meta_group,
+                    attention=self.single_attention,
                     proj_steps=proj_steps,
                     smooth_lr=smooth_lr,
-                    adaptive=False
                 )
                 for _ in range(self.num_layers)
             ])
@@ -175,7 +182,6 @@ class GPTWithGroup(nn.Module):
                 logits: (B, S, vocab_size)
                 manifold_distance: 平均流形距离
                 global_group_state: (B, d, d)
-                router_loss: 路由辅助损失（多群模式下）
                 expansion_info: 扩张信息（多群模式下）
         """
         device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -205,7 +211,6 @@ class GPTWithGroup(nn.Module):
         ).unsqueeze(0).expand(batch_size, -1, -1)
         manifold_distance = 0.0
         expansion_info = None
-        router_loss = None
 
         # 逐层处理：Transformer 块 + 群光滑层
         for i, (block, smooth_layer) in enumerate(zip(self.base_model.h, self.smooth_layers)):
@@ -232,7 +237,6 @@ class GPTWithGroup(nn.Module):
 
         # 动态群扩张分析
         if self.enable_dynamic_expansion:
-            # 始终调用 expander 获取 router_loss（即使未到 expansion warmup）
             target_gs = target_group_state if global_step >= expansion_warmup_steps else None
             expander_output = self.expander(
                 hidden_states=hidden_states,
@@ -240,7 +244,6 @@ class GPTWithGroup(nn.Module):
                 global_step=global_step,
                 global_group_state=global_group_state
             )
-            router_loss = expander_output.get('router_loss')
 
             if global_step >= expansion_warmup_steps and target_group_state is not None:
                 expansion_info = {
@@ -250,7 +253,7 @@ class GPTWithGroup(nn.Module):
                     'num_groups': expander_output['num_groups'],
                 }
                 if expansion_info['triggered']:
-                    print(f"[GPTWithGroup] 触发群扩张！当前群数量：{expansion_info['num_groups']}")
+                    print(f"[GPTWithGroup] 触发群扩张！当前子群数量：{expansion_info['num_groups']}")
 
         # 最终层归一化
         hidden_states = self.base_model.ln_f(hidden_states)
@@ -271,8 +274,6 @@ class GPTWithGroup(nn.Module):
             result = (logits, manifold_distance, global_group_state)
             if loss is not None:
                 result = result + (loss,)
-            if router_loss is not None:
-                result = result + (router_loss,)
             if expansion_info is not None:
                 result = result + (expansion_info,)
             return result
@@ -282,7 +283,7 @@ class GPTWithGroup(nn.Module):
             logits=logits,
             manifold_distance=manifold_distance,
             global_group_state=global_group_state,
-            router_loss=router_loss,
+            router_loss=None,
             expansion_info=expansion_info,
         )
 
@@ -359,7 +360,7 @@ class GPTWithGroup(nn.Module):
         if self.meta_group is not None:
             return self.meta_group
         if self.expander is not None:
-            return self.expander.registry.groups['group_0']
+            return self.expander.registry.meta_group
         return None
 
     def get_smooth_layers(self) -> nn.ModuleList:
@@ -388,31 +389,64 @@ class GPTWithGroup(nn.Module):
                 'smooth_layers': self.smooth_layers.state_dict(),
                 'lm_head': self.lm_head.state_dict(),
             }
+            config = {
+                'enable_dynamic_expansion': True,
+                'group_d': self.group_d,
+                'num_generators': self.num_generators,
+                'group_type': self.group_type,
+            }
         else:
             state_dict = {
                 'meta_group': self.meta_group.state_dict(),
                 'smooth_layers': self.smooth_layers.state_dict(),
                 'lm_head': self.lm_head.state_dict(),
             }
+            config = {
+                'enable_dynamic_expansion': False,
+                'group_d': self.group_d,
+                'num_generators': self.num_generators,
+                'group_type': self.group_type,
+            }
         torch.save(state_dict, f'{save_dir}/group_state.pt')
+        with open(f'{save_dir}/group_config.json', 'w') as f:
+            json.dump(config, f)
 
     @classmethod
     def load_pretrained(cls, load_dir: str, device: torch.device = None) -> 'GPTWithGroup':
         if device is None:
             device = torch.device('cpu')
 
-        model = cls(
-            base_model_name=load_dir,
-            use_pretrained=True
-        )
-
         group_state = torch.load(f'{load_dir}/group_state.pt', map_location=device)
+        config_path = f'{load_dir}/group_config.json'
 
-        if 'meta_group' in group_state:
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                config = json.load(f)
+            model = cls(
+                base_model_name=load_dir,
+                use_pretrained=True,
+                enable_dynamic_expansion=config.get('enable_dynamic_expansion', False),
+                group_d=config.get('group_d', 32),
+                num_generators=config.get('num_generators', 12),
+                group_type=config.get('group_type', 'orthogonal'),
+            )
+        else:
+            is_multi_group = 'expander' in group_state
+            model = cls(
+                base_model_name=load_dir,
+                use_pretrained=True,
+                enable_dynamic_expansion=is_multi_group,
+            )
+
+        if 'meta_group' in group_state and model.meta_group is not None:
             model.meta_group.load_state_dict(group_state['meta_group'])
-        if 'expander' in group_state:
+
+        if 'expander' in group_state and model.expander is not None:
             model.expander.load_state_dict(group_state['expander'])
-        model.smooth_layers.load_state_dict(group_state['smooth_layers'])
+
+        # Load smooth_layers
+        smooth_state = group_state['smooth_layers']
+        model.smooth_layers.load_state_dict(smooth_state, strict=False)
         model.lm_head.load_state_dict(group_state['lm_head'])
 
         return model.to(device)
@@ -428,7 +462,6 @@ class CausalLMOutputWithCrossAttentions:
         logits: (B, S, vocab_size)
         manifold_distance: 平均流形距离
         global_group_state: (B, d, d)
-        router_loss: 路由辅助损失（多群模式）
         expansion_info: 扩张信息（多群模式）
     """
     loss: Optional[torch.FloatTensor] = None

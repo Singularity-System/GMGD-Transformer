@@ -1,37 +1,33 @@
 """
-全局群注册表：管理多个 MetaGroup，支持动态扩张
+全局群注册表：组合 MetaGroup + GroupAttention
 
 核心功能：
-1. 管理多个 MetaGroup 实例（通过 SubGroupManager）
-2. 多尺度上下文路由器（通过 DomainRouter）
-3. 动态扩张：当检测到新域时，创建新群并扩展路由器
+1. 管理单个 MetaGroup（内含多个 SubGroup）
+2. 管理共享的 GroupAttention
+3. 动态扩张：添加新 SubGroup 时同步扩展注意力
 """
 
 import torch
 import torch.nn as nn
 from typing import Dict, List, Optional, Tuple
 from .meta_group import MetaGroup
-from .subgroup_manager import SubGroupManager
-from .domain_router import DomainRouter
+from .group_attention import GroupAttention
 
 
 class GroupRegistry(nn.Module):
     """
-    全局群注册表：组合 SubGroupManager + DomainRouter
+    全局群注册表：组合 MetaGroup + GroupAttention
 
     设计原则：
     1. 所有层共享同一个注册表
-    2. 路由器根据多尺度特征动态选择群
-    3. 支持动态添加新群
-    4. 向后兼容旧的单层 Linear 路由器接口
+    2. GroupAttention 是共享的（per-token query）
+    3. MetaGroup 管理 SubGroup 索引和扩张
 
     参数：
         hidden_dim: Transformer 隐层维度
         initial_group_d: 初始群表示维度
         initial_num_generators: 初始生成元个数
         group_type: 群类型
-        router_window_size: 路由器局部窗口大小
-        router_mlp_hidden: 路由器 MLP 隐藏维度
     """
 
     def __init__(
@@ -40,171 +36,128 @@ class GroupRegistry(nn.Module):
         initial_group_d: int = 16,
         initial_num_generators: int = 6,
         group_type: str = 'orthogonal',
-        router_window_size: int = 16,
-        router_mlp_hidden: int = 64
     ):
         super().__init__()
 
         self.hidden_dim = hidden_dim
         self.group_type = group_type
 
-        # 子群管理器
-        self.subgroup_manager = SubGroupManager(
+        # 元群（管理多个子群）
+        self.meta_group = MetaGroup(
+            d=initial_group_d,
+            group_type=group_type,
             hidden_dim=hidden_dim,
-            initial_group_d=initial_group_d,
-            initial_num_generators=initial_num_generators,
-            group_type=group_type
+            initial_subgroups=1,
+            initial_generators_per_subgroup=initial_num_generators,
         )
 
-        # 多尺度路由器
-        self.router = DomainRouter(
+        # 共享注意力
+        self.attention = GroupAttention(
             hidden_dim=hidden_dim,
-            num_groups=1,  # 初始只有 1 个群
-            window_size=router_window_size,
-            mlp_hidden=router_mlp_hidden
+            num_groups=1,
         )
-
-        # 路径积分闭合监控阈值
-        self.path_integral_threshold = 0.5
 
     # === 向后兼容接口 ===
 
     @property
     def groups(self) -> nn.ModuleDict:
-        """向后兼容：直接访问群字典"""
-        return self.subgroup_manager.groups
+        """向后兼容：返回子群 ModuleDict"""
+        result = nn.ModuleDict()
+        for i, sg in enumerate(self.meta_group.subgroups):
+            result[f"group_{i}"] = sg
+        return result
 
     @property
     def group_metadata(self) -> Dict[str, dict]:
-        """向后兼容：直接访问群元数据"""
-        return self.subgroup_manager.group_metadata
+        """向后兼容：返回子群元数据"""
+        return {
+            f"group_{i}": {
+                'group_d': self.meta_group.d,
+                'num_generators': sg.num_generators,
+            }
+            for i, sg in enumerate(self.meta_group.subgroups)
+        }
 
     @property
     def num_groups(self) -> int:
-        """返回当前注册的群数量"""
-        return self.subgroup_manager.num_groups
+        return len(self.meta_group.subgroups)
 
     def get_group_ids(self) -> List[str]:
-        """返回所有群 ID"""
-        return self.subgroup_manager.get_all_group_ids()
+        return [f"group_{i}" for i in range(self.num_groups)]
 
     def generate_next_id(self) -> str:
-        """生成下一个可用的群 ID"""
-        return self.subgroup_manager.generate_next_id()
-
-    def _register_group(self, group_id: str, group_d: int, num_generators: int):
-        """内部方法：注册一个新群（向后兼容）"""
-        return self.subgroup_manager.register_group(group_id, group_d, num_generators)
+        return f"group_{self.num_groups}"
 
     def register_new_group(
         self,
         group_id: str,
         group_d: int,
         num_generators: int,
-        generator_init: Optional[torch.Tensor] = None
+        generator_init: Optional[torch.Tensor] = None,
     ):
         """
-        注册一个新群（带初始化矩阵）
+        注册新子群（同步扩展注意力）
 
         Args:
-            group_id: 群 ID
+            group_id: 子群 ID（仅用于日志）
             group_d: 群维度
             num_generators: 生成元数量
-            generator_init: 可选的初始生成元矩阵 (num_generators, d, d)
+            generator_init: 可选的初始生成元
         """
-        self.subgroup_manager.register_group(group_id, group_d, num_generators, generator_init)
+        self.meta_group._add_subgroup(num_generators)
+        self.attention.expand_groups(self.num_groups)
 
-        # 扩展路由器
-        self.router.expand_router(self.num_groups)
+        print(f"[GroupRegistry] 注册新子群：{group_id} (d={group_d}, k={num_generators})")
 
-        print(f"[GroupRegistry] 注册新群：{group_id} (d={group_d}, k={num_generators})")
-
-    # === 路由接口 ===
+    # === 路由接口（向后兼容，新架构下不使用） ===
 
     def get_router_probs(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """
-        获取路由概率（向后兼容）
-
-        Args:
-            hidden_states: 隐状态 (B, S, hidden_dim)
-
-        Returns:
-            路由概率分布 (B, S, num_groups)
-        """
-        probs, indices, ids = self.router(hidden_states, force_hard=True)
-        # 去掉 fallback 维度
-        return probs[..., :-1]
+        """获取注意力权重（向后兼容接口）"""
+        return self.attention(hidden_states)
 
     def select_groups(
         self,
         hidden_states: torch.Tensor,
-        top_k: int = 1
+        top_k: int = 1,
     ) -> Tuple[List[str], torch.Tensor]:
         """
-        为每个 batch 选择激活的群
+        为每个 token 选择主导子群
 
         Returns:
-            selected_group_ids: 选中的群 ID 列表
-            router_probs: 路由概率 (B, S, num_groups)
+            selected_group_ids: 被选中的子群 ID 列表
+            router_probs: 注意力概率 (B, S, num_groups)
         """
-        probs, indices, ids = self.router(hidden_states, force_hard=not self.training)
-        # 去掉 fallback 维度
-        task_probs = probs[..., :-1]
-        return ids, task_probs
+        probs = self.attention(hidden_states)
+        ids = probs.argmax(dim=-1)
+        selected_ids = []
+        for i in range(self.num_groups):
+            if (ids == i).any():
+                selected_ids.append(f"group_{i}")
+        return selected_ids, probs
 
-    # === 前向传播 ===
+    # === 前向传播（新架构下不使用，保留向后兼容） ===
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         target_group_state: Optional[torch.Tensor] = None,
-        global_group_state: Optional[torch.Tensor] = None
+        global_group_state: Optional[torch.Tensor] = None,
     ) -> dict:
         """
-        前向传播：路由 + 群信息
-
-        Args:
-            hidden_states: 输入隐状态 (B, S, hidden_dim)
-            target_group_state: 目标群状态 (B, d, d)，用于路径积分闭合误差
-            global_group_state: 全局群状态 (B, d, d)，路径积分累乘结果
-
-        Returns:
-            output: 路由结果 + 群信息字典
+        前向传播：注意力权重 + 群信息（向后兼容）
         """
         B, S, H = hidden_states.shape
 
-        # 路由决策
-        probs, indices, selected_group_ids = self.router(hidden_states, force_hard=not self.training)
-        # 处理 fallback 情况（使用 group_0 作为默认）
-        selected_group_id = selected_group_ids[0] if selected_group_ids else 'group_0'
-        if selected_group_id == 'fallback' or selected_group_id not in self.groups:
-            selected_group_id = 'group_0'
+        probs = self.attention(hidden_states)
 
-        # 获取对应的群
-        group = self.subgroup_manager.get_group(selected_group_id)
-
-        # 更新群激活计数
-        self.group_metadata[selected_group_id]['activation_count'] += B * S
-
-        # 路由辅助损失
-        router_loss = self.router.compute_router_loss(probs)
-        load_balance_loss = self.router.compute_load_balance_loss(probs)
-        total_router_loss = router_loss + 0.1 * load_balance_loss
-
-        # 路径积分闭合误差
         path_integral_error = None
         if target_group_state is not None and global_group_state is not None:
             path_integral_error = self._compute_path_integral_error(
-                global_group_state, target_group_state, selected_group_id
+                global_group_state, target_group_state
             )
 
         return {
-            'selected_group_id': selected_group_id,
-            'group': group,
-            'router_probs': probs[..., :-1],  # 去掉 fallback
-            'router_loss': total_router_loss,
-            'router_entropy': router_loss,
-            'load_balance_loss': load_balance_loss,
+            'router_probs': probs,
             'path_integral_error': path_integral_error,
         }
 
@@ -212,7 +165,6 @@ class GroupRegistry(nn.Module):
         self,
         G_final: torch.Tensor,
         G_target: torch.Tensor,
-        group_id: str
     ) -> torch.Tensor:
         """计算路径积分闭合误差"""
         try:
@@ -223,12 +175,8 @@ class GroupRegistry(nn.Module):
         except RuntimeError:
             return torch.tensor(0.0, device=G_final.device)
 
-    # === 路径积分分析 ===
-
     def analyze_path_integral(self, G_final: torch.Tensor, G_target: torch.Tensor) -> dict:
-        """
-        分析路径积分闭合状态，为可能的新群创建提供依据
-        """
+        """分析路径积分闭合状态"""
         B, d, _ = G_final.shape
 
         try:
@@ -241,28 +189,17 @@ class GroupRegistry(nn.Module):
         I = torch.eye(d, device=G_final.device).unsqueeze(0).expand(B, -1, -1)
         deviation = torch.norm(delta_missing - I, dim=(-2, -1)).mean().item()
 
-        symmetric_part = 0.5 * (delta_missing + delta_missing.transpose(-2, -1))
-        skew_symmetric_part = 0.5 * (delta_missing - delta_missing.transpose(-2, -1))
-
-        symmetric_norm = torch.norm(symmetric_part, dim=(-2, -1)).mean().item()
-        skew_symmetric_norm = torch.norm(skew_symmetric_part, dim=(-2, -1)).mean().item()
-        det = torch.linalg.det(delta_missing).abs().mean().item()
-
         return {
             'deviation_from_identity': deviation,
-            'symmetric_norm': symmetric_norm,
-            'skew_symmetric_norm': skew_symmetric_norm,
-            'determinant': det,
-            'delta_missing_mean': delta_missing.mean().item(),
-            'needs_new_group': deviation > self.path_integral_threshold,
-            'candidate_generator': delta_missing.mean(dim=0).detach()
+            'needs_new_group': deviation > self.meta_group.expansion_threshold,
+            'candidate_generator': delta_missing.mean(dim=0).detach(),
         }
 
     def get_statistics(self) -> dict:
-        """获取所有群的统计信息"""
+        """获取所有子群的统计信息"""
         return {
             'num_groups': self.num_groups,
             'group_ids': self.get_group_ids(),
-            'subgroup_stats': self.subgroup_manager.get_statistics(),
-            'router': self.router.extra_repr(),
+            'attention': self.attention.extra_repr(),
+            'meta_group': self.meta_group.extra_repr(),
         }

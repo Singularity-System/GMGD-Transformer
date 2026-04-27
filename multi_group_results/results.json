@@ -1,0 +1,50 @@
+{
+  "phase_results": {
+    "phase1": {
+      "avg_loss": 0.0
+    },
+    "phase2": {
+      "avg_loss": 7.677826166152954,
+      "avg_manifold": 10578.827209472656,
+      "num_batches": 4,
+      "global_step": 4
+    },
+    "phase3": {
+      "avg_loss": 9.181686878204346,
+      "avg_manifold": 6206.6661376953125,
+      "num_batches": 4,
+      "global_step": 8
+    },
+    "phase4": {
+      "avg_loss": 9.111399531364441,
+      "avg_manifold": 10418.365051269531,
+      "num_batches": 4,
+      "global_step": 12
+    },
+    "phase5": {
+      "avg_loss": 8.543317317962646,
+      "avg_manifold": 3064.2021484375,
+      "num_batches": 4,
+      "global_step": 16
+    }
+  },
+  "eval_accuracy": {
+    "arithmetic": 0.75,
+    "language": 0.7,
+    "mixed": 0.15
+  },
+  "config": {
+    "train_length": 6,
+    "epochs": 1,
+    "samples": 50,
+    "phase_epochs": {
+      "1": 1,
+      "2": 1,
+      "3": 1,
+      "4": 1,
+      "5": 1
+    },
+    "group_d": 16,
+    "num_generators": 6
+  }
+}

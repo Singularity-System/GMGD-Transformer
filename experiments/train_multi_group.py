@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-多群 GroupAlgebra 五阶段训练协议
+多群 GroupAlgebra 四阶段训练协议
 
 阶段 1: 分域预训练 — 单群，纯算术数据，群学习代数规则
-阶段 2: 投影层预热 — 冻结生成元，训练投影层，学习路由
+阶段 2: 投影层预热 — 冻结生成元，训练投影层，学习注意力映射
 阶段 3: 交替冻结 — 交替冻结群/投影层，避免耦合震荡
-阶段 4: 稀疏路由 — 加入路由熵惩罚 + 多域数据，硬域分配
-阶段 5: 髓鞘化 — 降低所有 lr，全参数微调，稳定收敛
+阶段 4: 髓鞘化 — 降低所有 lr，全参数微调，稳定收敛
 
 用法：
     python experiments/train_multi_group.py --epochs 30 --samples 500
@@ -71,19 +70,19 @@ def get_param_groups(model, group_lr=2e-3, proj_lr=5e-4, other_lr=1e-4):
     """三层学习率参数分组"""
     mg_params = set()
     proj_params = set()
-    router_params = set()
+    attn_params = set()
 
     for n, p in model.named_parameters():
         if 'meta_group' in n and 'generator_params' in n:
             mg_params.add(id(p))
-        elif 'proj_to' in n or 'proj_from' in n or 'gate_network' in n or 'logit_alpha' in n or 'step_counter' in n:
+        elif 'proj_to' in n or 'proj_from' in n or 'logit_alpha' in n:
             proj_params.add(id(p))
-        elif 'router' in n or 'expander' in n:
-            router_params.add(id(p))
+        elif 'attention' in n or 'query_proj' in n or 'group_keys' in n:
+            attn_params.add(id(p))
 
     other_params = [
         p for p in model.parameters()
-        if id(p) not in mg_params and id(p) not in proj_params and id(p) not in router_params
+        if id(p) not in mg_params and id(p) not in proj_params and id(p) not in attn_params
     ]
 
     param_groups = []
@@ -95,9 +94,9 @@ def get_param_groups(model, group_lr=2e-3, proj_lr=5e-4, other_lr=1e-4):
     if proj_list:
         param_groups.append({'params': proj_list, 'lr': proj_lr})
 
-    router_list = [p for p in model.parameters() if id(p) in router_params]
-    if router_list:
-        param_groups.append({'params': router_list, 'lr': proj_lr})
+    attn_list = [p for p in model.parameters() if id(p) in attn_params]
+    if attn_list:
+        param_groups.append({'params': attn_list, 'lr': proj_lr})
 
     if other_params:
         param_groups.append({'params': other_params, 'lr': other_lr})
@@ -128,7 +127,6 @@ def train_epoch(
     epoch: int,
     device,
     manifold_loss_weight: float = 0.5,
-    router_loss_weight: float = 0.0,
     global_step: int = 0,
     desc: str = "Training"
 ) -> dict:
@@ -142,7 +140,6 @@ def train_epoch(
         epoch: 当前 epoch
         device: 设备
         manifold_loss_weight: 流形损失权重
-        router_loss_weight: 路由损失权重
         global_step: 全局步数
         desc: 进度条描述
 
@@ -152,7 +149,6 @@ def train_epoch(
     model.train()
     total_loss = 0.0
     total_manifold = 0.0
-    total_router = 0.0
     num_batches = 0
 
     # 循环所有加载器，取最长的那个
@@ -190,12 +186,9 @@ def train_epoch(
 
         loss = outputs.loss
         manifold_dist = outputs.manifold_distance
-        router_loss = outputs.router_loss
 
         # 总损失
         total_loss_value = loss + manifold_loss_weight * manifold_dist
-        if router_loss is not None and router_loss_weight > 0:
-            total_loss_value = total_loss_value + router_loss_weight * router_loss
 
         if torch.isfinite(total_loss_value):
             total_loss_value.backward()
@@ -210,7 +203,6 @@ def train_epoch(
 
         total_loss += loss.item()
         total_manifold += manifold_dist.item() if manifold_dist is not None else 0.0
-        total_router += router_loss.item() if router_loss is not None else 0.0
         num_batches += 1
         global_step += 1
 
@@ -222,7 +214,6 @@ def train_epoch(
     stats = {
         'avg_loss': total_loss / max(num_batches, 1),
         'avg_manifold': total_manifold / max(num_batches, 1),
-        'avg_router': total_router / max(num_batches, 1),
         'num_batches': num_batches,
         'global_step': global_step,
     }
@@ -281,7 +272,6 @@ def train_phase_1(
     stats = train_epoch(
         model, [loader], optimizer, 0, device,
         manifold_loss_weight=0.5,
-        router_loss_weight=0.0,
         global_step=global_step,
         desc="Phase 1: Arithmetic pretraining"
     )
@@ -314,7 +304,6 @@ def train_phase_2(
         stats = train_epoch(
             model, loaders, optimizer, epoch, device,
             manifold_loss_weight=0.3,
-            router_loss_weight=0.0,
             global_step=global_step,
             desc="Phase 2: Proj warmup"
         )
@@ -364,7 +353,6 @@ def train_phase_3(
         stats = train_epoch(
             model, loaders, optimizer, epoch, device,
             manifold_loss_weight=0.5,
-            router_loss_weight=0.0,
             global_step=global_step,
             desc=desc
         )
@@ -381,9 +369,9 @@ def train_phase_3(
 def train_phase_4(
     model, train_datasets, optimizer, device, epochs: int, global_step: int
 ) -> dict:
-    """阶段 4: 稀疏路由 — 加路由熵惩罚，硬域分配"""
+    """阶段 4: 多域训练 — 加入语言+混合数据"""
     print("\n" + "=" * 60)
-    print("阶段 4: 稀疏路由 — 硬域分配")
+    print("阶段 4: 多域训练 — 全数据训练")
     print("=" * 60)
 
     loaders = [
@@ -394,20 +382,16 @@ def train_phase_4(
 
     all_losses = []
     for epoch in range(1, epochs + 1):
-        # 逐渐增加路由损失权重
-        router_weight = min(0.1 * epoch, 1.0)
-
         stats = train_epoch(
             model, loaders, optimizer, epoch, device,
             manifold_loss_weight=0.5,
-            router_loss_weight=router_weight,
             global_step=global_step,
-            desc=f"Phase 4: Router w={router_weight:.2f}"
+            desc=f"Phase 4: Multi-domain epoch {epoch}"
         )
         all_losses.append(stats)
         global_step = stats['global_step']
         print(f"  Epoch {epoch}: loss={stats['avg_loss']:.4f}, "
-              f"manifold={stats['avg_manifold']:.4f}, router={stats['avg_router']:.4f}")
+              f"manifold={stats['avg_manifold']:.4f}")
 
     return all_losses[-1] if all_losses else {}
 
@@ -434,7 +418,6 @@ def train_phase_5(
         stats = train_epoch(
             model, loaders, optimizer, epoch, device,
             manifold_loss_weight=0.5,
-            router_loss_weight=0.5,
             global_step=global_step,
             desc="Phase 5: Myelination"
         )
