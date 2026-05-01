@@ -30,13 +30,20 @@ from torch.utils.data import DataLoader
 from transformers import GPT2Tokenizer
 from tqdm import tqdm
 
-from core import GPTWithGroup
+from core import GPTWithGroup, DOMAIN_ARITHMETIC, DOMAIN_LANGUAGE, DOMAIN_MIXED
 from data.multi_domain_dataset import (
     MultiDomainDataset,
     create_multi_domain_datasets,
     get_domain_loader,
     collate_fn
 )
+
+# 域名称到域 ID 的映射
+DOMAIN_ID_MAP = {
+    'arithmetic': DOMAIN_ARITHMETIC,
+    'language': DOMAIN_LANGUAGE,
+    'mixed': DOMAIN_MIXED,
+}
 
 device = torch.device('cpu')  # GPT-2 generate 在 MPS 上有 bug
 print(f"Using device: {device}")
@@ -66,23 +73,23 @@ def prepare_data(train_length: int = 10, samples: int = 500, seed: int = 42):
 
 # ==================== 参数分组 ====================
 
-def get_param_groups(model, group_lr=2e-3, proj_lr=5e-4, other_lr=1e-4):
-    """三层学习率参数分组"""
+def get_param_groups(model, group_lr=2e-3, proj_lr=5e-4, domain_lr=1e-3, other_lr=1e-4):
+    """参数分组：群、投影、域嵌入、其他"""
     mg_params = set()
     proj_params = set()
-    attn_params = set()
+    domain_params = set()
 
     for n, p in model.named_parameters():
-        if 'meta_group' in n and 'generator_params' in n:
+        if 'generators' in n:
             mg_params.add(id(p))
-        elif 'proj_to' in n or 'proj_from' in n or 'logit_alpha' in n:
+        elif 'proj_to' in n or 'proj_from' in n:
             proj_params.add(id(p))
-        elif 'attention' in n or 'query_proj' in n or 'group_keys' in n:
-            attn_params.add(id(p))
+        elif 'domain_manager' in n or 'domain_to_attn' in n:
+            domain_params.add(id(p))
 
     other_params = [
         p for p in model.parameters()
-        if id(p) not in mg_params and id(p) not in proj_params and id(p) not in attn_params
+        if id(p) not in mg_params and id(p) not in proj_params and id(p) not in domain_params
     ]
 
     param_groups = []
@@ -94,9 +101,9 @@ def get_param_groups(model, group_lr=2e-3, proj_lr=5e-4, other_lr=1e-4):
     if proj_list:
         param_groups.append({'params': proj_list, 'lr': proj_lr})
 
-    attn_list = [p for p in model.parameters() if id(p) in attn_params]
-    if attn_list:
-        param_groups.append({'params': attn_list, 'lr': proj_lr})
+    domain_list = [p for p in model.parameters() if id(p) in domain_params]
+    if domain_list:
+        param_groups.append({'params': domain_list, 'lr': domain_lr})
 
     if other_params:
         param_groups.append({'params': other_params, 'lr': other_lr})
@@ -123,6 +130,7 @@ def unfreeze_params(param_ids: set, model):
 def train_epoch(
     model,
     loaders: List[DataLoader],
+    domain_names: List[str],
     optimizer,
     epoch: int,
     device,
@@ -136,6 +144,7 @@ def train_epoch(
     Args:
         model: GPTWithGroup 模型
         loaders: 数据加载器列表（多域时多个）
+        domain_names: 各加载器对应的域名称列表
         optimizer: 优化器
         epoch: 当前 epoch
         device: 设备
@@ -158,7 +167,6 @@ def train_epoch(
     for step_idx in pbar:
         # 从不同域轮流采样
         loader_idx = step_idx % len(loaders)
-        batch_idx = step_idx % len(loaders[loader_idx])
         batch = next(iter(DataLoader(
             loaders[loader_idx].dataset,
             batch_size=loaders[loader_idx].batch_size,
@@ -170,25 +178,26 @@ def train_epoch(
         input_ids = batch['input_ids'].to(device)
         labels = batch['labels'].to(device)
 
+        # 创建 token 域标签 (B, S)
+        domain_id = DOMAIN_ID_MAP[domain_names[loader_idx]]
+        token_domain_ids = torch.full_like(input_ids, domain_id, dtype=torch.long)
+
         optimizer.zero_grad()
 
-        # 前向传播
-        target_group_state = torch.eye(
-            model.group_d, device=device
-        ).unsqueeze(0).expand(input_ids.shape[0], -1, -1)
-
+        # 前向传播（带域标签）
         outputs = model(
             input_ids=input_ids,
             labels=labels,
-            target_group_state=target_group_state,
+            token_domain_ids=token_domain_ids,
             global_step=global_step
         )
 
-        loss = outputs.loss
-        manifold_dist = outputs.manifold_distance
+        loss = outputs['loss']
+        manifold_dist = outputs['manifold_distance']
+        entropy_bonus = outputs.get('entropy_bonus', torch.tensor(0.0))
 
-        # 总损失
-        total_loss_value = loss + manifold_loss_weight * manifold_dist
+        # 总损失：CE + manifold + entropy bonus（负值 → 鼓励探索）
+        total_loss_value = loss + manifold_loss_weight * manifold_dist + entropy_bonus
 
         if torch.isfinite(total_loss_value):
             total_loss_value.backward()
@@ -221,27 +230,35 @@ def train_epoch(
 
 
 @torch.no_grad()
-def evaluate(model, dataset, tokenizer, device, batch_size=16) -> float:
+def evaluate(model, dataset, tokenizer, device, domain_name: str, batch_size=16) -> float:
     """评估准确率"""
     model.eval()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
     correct = 0
     total = 0
+    domain_id = DOMAIN_ID_MAP[domain_name]
 
     for batch in loader:
         input_ids = batch['input_ids'].to(device)
         attention_mask = (input_ids != tokenizer.pad_token_id).long()
         answers = batch['answer']
 
-        generated = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=8,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id
-        )
+        # 创建 token 域标签
+        token_domain_ids = torch.full_like(input_ids, domain_id, dtype=torch.long)
+
+        # 手动 generate: 逐步 forward，注入 domain signal
+        generated = input_ids.clone()
+        for _ in range(8):  # max 8 new tokens
+            cur_len = generated.shape[1]
+            cur_mask = (generated != tokenizer.pad_token_id).long()
+            outputs = model(
+                input_ids=generated,
+                token_domain_ids=token_domain_ids if token_domain_ids.shape[1] == cur_len else torch.full_like(generated, domain_id, dtype=torch.long)
+            )
+            logits = outputs['logits']
+            next_token = torch.argmax(logits[:, -1, :], dim=-1)
+            generated = torch.cat([generated, next_token.unsqueeze(1)], dim=1)
 
         for gen_ids, true_val in zip(generated, answers):
             pred_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
@@ -270,7 +287,7 @@ def train_phase_1(
     loader = get_domain_loader(arith_dataset, batch_size=16)
 
     stats = train_epoch(
-        model, [loader], optimizer, 0, device,
+        model, [loader], ['arithmetic'], optimizer, 0, device,
         manifold_loss_weight=0.5,
         global_step=global_step,
         desc="Phase 1: Arithmetic pretraining"
@@ -289,7 +306,7 @@ def train_phase_2(
     # 冻结生成元
     mg_params = set()
     for n, p in model.named_parameters():
-        if 'meta_group' in n and 'generator_params' in n:
+        if 'generators' in n:
             mg_params.add(id(p))
     freeze_params(mg_params, model)
 
@@ -298,11 +315,12 @@ def train_phase_2(
         get_domain_loader(train_datasets['train_arithmetic'], batch_size=16),
         get_domain_loader(train_datasets['train_mixed'], batch_size=16),
     ]
+    domain_names = ['arithmetic', 'mixed']
 
     all_losses = []
     for epoch in range(1, epochs + 1):
         stats = train_epoch(
-            model, loaders, optimizer, epoch, device,
+            model, loaders, domain_names, optimizer, epoch, device,
             manifold_loss_weight=0.3,
             global_step=global_step,
             desc="Phase 2: Proj warmup"
@@ -327,15 +345,16 @@ def train_phase_3(
     mg_params = set()
     proj_params = set()
     for n, p in model.named_parameters():
-        if 'meta_group' in n and 'generator_params' in n:
+        if 'generators' in n:
             mg_params.add(id(p))
-        elif 'proj_to' in n or 'proj_from' in n or 'gate_network' in n or 'logit_alpha' in n:
+        elif 'proj_to' in n or 'proj_from' in n or 'logit_alpha' in n:
             proj_params.add(id(p))
 
     loaders = [
         get_domain_loader(train_datasets['train_arithmetic'], batch_size=16),
         get_domain_loader(train_datasets['train_mixed'], batch_size=16),
     ]
+    domain_names = ['arithmetic', 'mixed']
 
     all_losses = []
     for epoch in range(1, epochs + 1):
@@ -351,7 +370,7 @@ def train_phase_3(
             desc = "Phase 3: Freeze gen, train proj"
 
         stats = train_epoch(
-            model, loaders, optimizer, epoch, device,
+            model, loaders, domain_names, optimizer, epoch, device,
             manifold_loss_weight=0.5,
             global_step=global_step,
             desc=desc
@@ -379,11 +398,12 @@ def train_phase_4(
         get_domain_loader(train_datasets['train_language'], batch_size=16),
         get_domain_loader(train_datasets['train_mixed'], batch_size=16),
     ]
+    domain_names = ['arithmetic', 'language', 'mixed']
 
     all_losses = []
     for epoch in range(1, epochs + 1):
         stats = train_epoch(
-            model, loaders, optimizer, epoch, device,
+            model, loaders, domain_names, optimizer, epoch, device,
             manifold_loss_weight=0.5,
             global_step=global_step,
             desc=f"Phase 4: Multi-domain epoch {epoch}"
@@ -412,11 +432,12 @@ def train_phase_5(
         get_domain_loader(train_datasets['train_arithmetic'], batch_size=16),
         get_domain_loader(train_datasets['train_mixed'], batch_size=16),
     ]
+    domain_names = ['arithmetic', 'mixed']
 
     all_losses = []
     for epoch in range(1, epochs + 1):
         stats = train_epoch(
-            model, loaders, optimizer, epoch, device,
+            model, loaders, domain_names, optimizer, epoch, device,
             manifold_loss_weight=0.5,
             global_step=global_step,
             desc="Phase 5: Myelination"
@@ -456,12 +477,8 @@ def run_multi_group_training(
     model = GPTWithGroup(
         base_model_name='gpt2',
         group_d=16,
-        num_generators=6,
-        group_type='orthogonal',
+        num_initial_active_groups=1,
         use_pretrained=True,
-        enable_dynamic_expansion=True,
-        expansion_threshold=0.5,
-        max_generators_per_group=12
     ).to(device)
 
     print(f"总参数量：{model.get_num_params():,}")
@@ -547,7 +564,7 @@ def run_multi_group_training(
     eval_results = {}
     for domain in ['arithmetic', 'language', 'mixed']:
         eval_dataset = datasets[f'eval_{domain}']
-        acc = evaluate(model, eval_dataset, tokenizer, device, batch_size=16)
+        acc = evaluate(model, eval_dataset, tokenizer, device, domain_name=domain, batch_size=16)
         eval_results[domain] = acc
         print(f"  {domain}: accuracy = {acc:.2%}")
 

@@ -1,37 +1,38 @@
 """
 GMGD 核心模块
 
-包含群扩展 Transformer 的核心组件：
-- MetaGroup: 元群（管理 SubGroup 索引 + 扩张）
-- SubGroup: 子群（独立生成元 + 投影层）
-- GroupAttention: 共享注意力聚合器
-- GroupSmoothLayer: 群光滑层（含 Alpha Warm-up）
-- GPTWithGroup: 群扩展 GPT 模型（支持单群/多群）
-- GroupRegistry: 全局群注册表
-- DynamicGroupExpander: 动态群扩张控制器
-- PathIntegralAnalyzer: 路径积分分析器
+核心组件：
+- Group: 纯群操作（生成元 + Cayley + 流形投影）
+- TGroup: Transformer 群操作（Group + hidden_states 交互）
+- MetaGroup: 管理群（Group 子类，管理 TGroup 列表）
+- DomainManager: 全局域嵌入管理器（EMA 平滑 + 主导切换 + 渐进式恢复）
+- GroupSmoothLayer: 光滑层（用域嵌入做群选择）
+- GPTWithGroup: 完整模型
 """
 
-from .meta_group import MetaGroup, cayley_exp, stable_matrix_exp
-from .subgroup import SubGroup
-from .group_attention import GroupAttention
-from .group_smooth_layer import GroupSmoothLayer
-from .gpt_with_group import GPTWithGroup, CausalLMOutputWithCrossAttentions
-from .group_registry import GroupRegistry
-from .dynamic_expander import DynamicGroupExpander
-from .path_integral import PathIntegralAnalyzer, PathIntegralAnalysis
+from .group import Group, cayley_exp
+from .tgroup import TGroup
+from .meta_group import MetaGroup
+from .gm_model import (
+    DomainManager,
+    GroupSmoothLayer,
+    GPTWithGroup,
+    DOMAIN_ARITHMETIC,
+    DOMAIN_LANGUAGE,
+    DOMAIN_MIXED,
+    NUM_DOMAINS,
+)
 
 __all__ = [
+    'Group',
+    'cayley_exp',
+    'TGroup',
     'MetaGroup',
-    'SubGroup',
-    'GroupAttention',
+    'DomainManager',
     'GroupSmoothLayer',
     'GPTWithGroup',
-    'CausalLMOutputWithCrossAttentions',
-    'cayley_exp',
-    'stable_matrix_exp',
-    'GroupRegistry',
-    'DynamicGroupExpander',
-    'PathIntegralAnalyzer',
-    'PathIntegralAnalysis',
+    'DOMAIN_ARITHMETIC',
+    'DOMAIN_LANGUAGE',
+    'DOMAIN_MIXED',
+    'NUM_DOMAINS',
 ]
