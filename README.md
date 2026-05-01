@@ -56,10 +56,19 @@ logits = model(input_ids)
 ```
 GPTWithGroup
 ├── DomainManager      # 全局域嵌入（方向向量 + EMA 平滑 + 主导切换）
-├── GroupSmoothLayer   # 群光滑层（域选择 + 群修正）
-│   └── MetaGroup      # 元群管理器
-│       └── TGroup     # Transformer 群操作
-│           └── Group  # 纯群操作（Cayley 指数映射 + 流形投影）
+└── GroupSmoothLayer   # 群光滑层（域选择 + 群修正）
+    └── MetaGroup      # 元群管理器（继承 Group，管理 TGroup 列表）
+        ├── TGroup     # Transformer 群操作（继承 Group）
+        └── TGroup     # 多个 TGroup 实例
+            └── Group  # 纯群操作基础类（Cayley 指数映射 + 流形投影）
+```
+
+### 继承关系
+
+```
+Group       # 基础类：纯群操作（生成元 + Cayley 指数映射 + 流形投影）
+├── TGroup   # Transformer 群操作：添加 proj_to/proj_from，与 hidden_states 交互
+└── MetaGroup # 元群管理器：管理多个 TGroup 实例
 ```
 
 ### 域管理器（DomainManager）
